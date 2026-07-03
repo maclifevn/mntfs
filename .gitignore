@@ -1,0 +1,10 @@
+build/
+*.o
+*.img
+.DS_Store
+xcuserdata/
+vendor/ntfs-3g/**/*.o
+vendor/ntfs-3g/**/*.lo
+vendor/ntfs-3g/config.log
+vendor/ntfs-3g/build.log
+vendor/ntfs-3g/configure.log
