@@ -20,10 +20,10 @@
 		<dict/>
 		<key>FSPersonalities</key>
 		<dict>
-			<key>FastNTFS</key>
+			<key>Mntfs</key>
 			<dict>
 				<key>FSName</key>
-				<string>FastNTFS</string>
+				<string>Mntfs</string>
 				<key>FSfileObjectsAreCaseSensitive</key>
 				<false/>
 			</dict>
@@ -31,7 +31,7 @@
 		<key>FSRequiresSecurityScopedPathURLResources</key>
 		<false/>
 		<key>FSShortName</key>
-		<string>fastntfs</string>
+		<string>mntfs</string>
 		<key>FSSupportsBlockResources</key>
 		<true/>
 		<key>FSSupportsGenericURLResources</key>

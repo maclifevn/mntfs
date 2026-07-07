@@ -23,7 +23,7 @@ Gatekeeper on, no kernel extension). Verified on macOS 26.5.1 / Apple M5.
 | Layer | State |
 | --- | --- |
 | NTFS engine (`Sources/FSModule/Bridge/fntfs.c`) | ✅ Complete, validated by a full test suite (`tests/test_fntfs.c`): mount, probe, read, write, create, mkdir, rename (file/dir/cross-dir), hard links, truncate, timestamps, Windows attributes, Unicode names, cookie-resumable enumeration, persistence, `ntfsfix`-clean images |
-| FSKit extension (Swift) | ✅ Builds, signs, registers with `fskitd`, and **mounts live** via `mount -F -t fastntfs` |
+| FSKit extension (Swift) | ✅ Builds, signs, registers with `fskitd`, and **mounts live** via `mount -F -t mntfs` |
 | Real mount (macOS VFS) | ✅ `cp`, `ls -la`, mkdir, Unicode names, nested dirs, 100 MB files — all through Finder/VFS. Data verified byte-identical on copy-out, and cross-read by independent `ntfsls`/`ntfscat` (i.e. Windows/Linux read it too). `ntfsfix` reports the written volume structurally clean. |
 | Real throughput (through the full FSKit XPC path, SSD-backed image) | ✅ **~860 MB/s write, ~700 MB/s read** — the driver saturates any real external disk, and is ~20–40× faster than macFUSE + ntfs-3g |
 | Engine throughput (in-process, cached image) | ✅ ~3.5 GB/s write, ~17 GB/s read — the engine itself is never the bottleneck |
@@ -63,7 +63,7 @@ Then:
 3. Plug in an NTFS disk — or mount manually:
 
 ```sh
-mount -F -t fastntfs /dev/diskXsY /path/to/mountpoint
+mount -F -t mntfs /dev/diskXsY /path/to/mountpoint
 ```
 
 ## Test the engine without FSKit

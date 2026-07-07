@@ -181,7 +181,7 @@ extension NTFSVolume: FSVolume.Operations {
     }
 
     var volumeStatistics: FSStatFSResult {
-        let res = FSStatFSResult(fileSystemTypeName: "fastntfs")
+        let res = FSStatFSResult(fileSystemTypeName: "mntfs")
         guard let v = vol else { return res }
         var sf = fntfs_statfs_t()
         if fntfs_statfs(v, &sf) == 0 {

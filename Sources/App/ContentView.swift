@@ -1,6 +1,8 @@
 //
 //  ContentView.swift
-//  FastNTFS — Paragon-style volume manager UI with Maclife branding.
+//  Mntfs — NTFS volume manager. Its own visual identity: a Maclife-blue
+//  midnight theme, a capacity ring as the hero, pill actions and switch
+//  toggles. Same job as any NTFS manager, deliberately not a clone of one.
 //
 
 import SwiftUI
@@ -17,20 +19,26 @@ private extension Color {
 }
 
 private enum UI {
-    static let sidebar   = Color(0x1f2836)
-    static let sidebarTop = Color(0x26313f)
-    static let detailA   = Color(0x2b3644)
-    static let detailB   = Color(0x212b38)
-    static let line      = Color.white.opacity(0.07)
-    static let card      = Color.white.opacity(0.045)
-    static let text      = Color(0xe8edf3)
-    static let dim       = Color(0x93a0b1)
-    static let faint     = Color(0x68727f)
-    static let accent    = Color(0x12c3f4)
-    static let link      = Color(0x4aa8ec)
-    static let green     = Color(0x37c85b)
-    static let amber     = Color(0xf0a83a)
-    static let sel       = Color(0x7d94b2).opacity(0.20)
+    static let appBG   = Color(0x0d1720)
+    static let sidebar = Color(0x0f1a24)
+    static let detailA = Color(0x16232f)
+    static let detailB = Color(0x0e1822)
+    static let line    = Color.white.opacity(0.07)
+    static let card    = Color.white.opacity(0.04)
+    static let text    = Color(0xeef4fa)
+    static let dim     = Color(0x90a4b6)
+    static let faint   = Color(0x5f7183)
+    static let accent  = Color(0x12c3f4)
+    static let accentDeep = Color(0x0066ab)
+    static let green   = Color(0x37d07f)
+    static let amber   = Color(0xf5a623)
+    static let rose    = Color(0xff6f6f)
+
+    static let ntfsGrad = LinearGradient(colors: [Color(0x18c8f5), Color(0x0a72bd)],
+                                         startPoint: .top, endPoint: .bottom)
+    static let ringGrad = AngularGradient(
+        gradient: Gradient(colors: [Color(0x0066ab), Color(0x12c3f4), Color(0x7fe4ff)]),
+        center: .center, startAngle: .degrees(-90), endAngle: .degrees(270))
 }
 
 // MARK: - Maclife logo mark
@@ -58,45 +66,38 @@ struct MaclifeMark: View {
     }
 }
 
-/// External-drive graphic with the Maclife badge (the app's signature mark).
-struct DriveGraphic: View {
-    var size: CGFloat = 210
+/// A flat, branded disk tile — Mntfs's mark, distinct from a photoreal drive.
+struct DiskEmblem: View {
+    var size: CGFloat
     var body: some View {
-        let w = size, h = size * 150 / 210
-        ZStack(alignment: .bottomLeading) {
-            ZStack(alignment: .top) {
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(LinearGradient(colors: [Color(0xe9edf1), Color(0xc4cbd4), Color(0x98a1ad)],
-                                         startPoint: .top, endPoint: .bottom))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(0x7a828f), lineWidth: 1.5))
-                VStack(spacing: 0) {
-                    UnevenRoundedRectangle(topLeadingRadius: 14, topTrailingRadius: 14)
-                        .fill(LinearGradient(colors: [Color(0x4c5663), Color(0x333b46)],
-                                             startPoint: .top, endPoint: .bottom))
-                        .frame(height: h * 0.26)
-                        .overlay(alignment: .topTrailing) {
-                            Circle().fill(UI.accent).frame(width: 6, height: 6)
-                                .padding(.top, h * 0.13).padding(.trailing, 16)
-                        }
-                    Spacer()
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    Spacer().frame(height: h * 0.42)
-                    Capsule().fill(Color(0x8b93a0).opacity(0.7)).frame(width: w * 0.55, height: 5)
-                    Capsule().fill(Color(0x8b93a0).opacity(0.5)).frame(width: w * 0.38, height: 5)
-                }.padding(.leading, w * 0.18)
-            }
-            .frame(width: w, height: h)
-
-            ZStack {
-                Circle().fill(.white)
-                    .overlay(Circle().stroke(Color(0xd3d8de), lineWidth: 1.5))
-                MaclifeMark().padding(size * 0.055)
-            }
-            .frame(width: size * 0.285, height: size * 0.285)
-            .offset(x: -size * 0.02, y: size * 0.06)
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
+                .fill(LinearGradient(colors: [Color(0x223444), Color(0x152230)],
+                                     startPoint: .top, endPoint: .bottom))
+                .overlay(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+                .shadow(color: .black.opacity(0.35), radius: size * 0.08, y: size * 0.03)
+            MaclifeMark().padding(size * 0.24)
         }
-        .frame(width: w, height: h + size * 0.06)
+        .frame(width: size, height: size)
+    }
+}
+
+/// Capacity ring — the hero. Maclife-gradient arc over a faint track.
+struct CapacityRing: View {
+    var fraction: Double
+    var size: CGFloat
+    var body: some View {
+        let lw = size * 0.085
+        ZStack {
+            Circle().stroke(Color.white.opacity(0.08), lineWidth: lw)
+            Circle()
+                .trim(from: 0, to: max(0.004, min(1, fraction)))
+                .stroke(UI.ringGrad, style: StrokeStyle(lineWidth: lw, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            DiskEmblem(size: size * 0.44)
+        }
+        .frame(width: size, height: size)
     }
 }
 
@@ -120,6 +121,7 @@ struct VolumeItem: Identifiable, Hashable {
     var mounted: Bool { mountPoint != nil }
     var displayName: String { name.isEmpty ? "Untitled" : name }
     var sizeText: String { ByteCount.string(sizeBytes) }
+    var usedFraction: Double { sizeBytes > 0 ? Double(usedBytes) / Double(sizeBytes) : 0 }
 }
 
 enum ByteCount {
@@ -151,8 +153,6 @@ final class VolumeStore: ObservableObject {
         }
     }
 
-    // MARK: diskutil enumeration
-
     private static func run(_ args: [String]) -> Data? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
@@ -173,7 +173,6 @@ final class VolumeStore: ObservableObject {
     private static func enumerate() -> [VolumeItem] {
         guard let list = plist(run(["list", "-plist"])),
               let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
-
         var ids: [String] = []
         for disk in disks {
             if let parts = disk["Partitions"] as? [[String: Any]] {
@@ -183,7 +182,6 @@ final class VolumeStore: ObservableObject {
                 ids += vols.compactMap { $0["DeviceIdentifier"] as? String }
             }
         }
-
         var items: [VolumeItem] = []
         for id in ids {
             guard let info = plist(run(["info", "-plist", id])) else { continue }
@@ -198,10 +196,7 @@ final class VolumeStore: ObservableObject {
             let writable = (info["WritableVolume"] as? NSNumber)?.boolValue ?? true
             let ejectable = (info["Ejectable"] as? NSNumber)?.boolValue ?? false
             let dev = (info["DeviceNode"] as? String) ?? "/dev/\(id)"
-
-            let isNTFS = fs.localizedCaseInsensitiveContains("ntfs")
-                || content == "Windows_NTFS"
-
+            let isNTFS = fs.localizedCaseInsensitiveContains("ntfs") || content == "Windows_NTFS"
             var used: Int64 = 0, free: Int64 = 0
             if let mp = mount,
                let a = try? FileManager.default.attributesOfFileSystem(forPath: mp) {
@@ -210,7 +205,6 @@ final class VolumeStore: ObservableObject {
                 used = max(0, total - free)
             }
             let nobrowse = mount.map { !$0.hasPrefix("/Volumes") && $0 != "/" } ?? false
-
             items.append(VolumeItem(
                 id: id, name: name, sizeBytes: size, device: dev, fileSystem: fs,
                 content: content, mountPoint: mount, writable: writable,
@@ -220,14 +214,10 @@ final class VolumeStore: ObservableObject {
         return items
     }
 
-    // MARK: actions
-
     func toggleMount(_ v: VolumeItem) {
         _ = Self.run([v.mounted ? "unmount" : "mount", v.device])
         refresh()
     }
-
-    // MARK: fallback sample (matches design preview)
 
     private static func sample() -> [VolumeItem] {
         func mk(_ id: String, _ n: String, _ gb: Double, ntfs: Bool, mounted: Bool,
@@ -235,70 +225,108 @@ final class VolumeStore: ObservableObject {
                 eject: Bool = false, nobrowse: Bool = false, usedFrac: Double = 0.5) -> VolumeItem {
             let size = Int64(gb * 1_000_000_000)
             let used = Int64(Double(size) * usedFrac)
-            return VolumeItem(id: id, name: n, sizeBytes: size, device: dev,
-                              fileSystem: fs, content: content,
-                              mountPoint: mounted ? "/Volumes/\(n)" : nil,
-                              writable: !ro, ejectable: eject, isNTFS: ntfs,
-                              nobrowse: nobrowse, usedBytes: used, freeBytes: size - used)
+            return VolumeItem(id: id, name: n, sizeBytes: size, device: dev, fileSystem: fs,
+                              content: content, mountPoint: mounted ? "/Volumes/\(n)" : nil,
+                              writable: !ro, ejectable: eject, isNTFS: ntfs, nobrowse: nobrowse,
+                              usedBytes: used, freeBytes: size - used)
         }
         return [
-            mk("disk0s6", "BOOTCAMP", 40.15, ntfs: true, mounted: true, dev: "/dev/disk0s6",
-               fs: "Microsoft NTFS", content: "Windows_NTFS", usedFrac: 0.501),
-            mk("disk4s1", "My USB Stick", 15.16, ntfs: true, mounted: true, dev: "/dev/disk4s1",
-               fs: "Microsoft NTFS", ro: true, eject: true, usedFrac: 0.4),
-            mk("disk5s1", "My Portable Drive", 499.93, ntfs: true, mounted: true, dev: "/dev/disk5s1",
-               fs: "Microsoft NTFS", eject: true, usedFrac: 0.62),
-            mk("disk6s1", "My Photo Archive", 499.8, ntfs: true, mounted: false, dev: "/dev/disk6s1",
-               fs: "Microsoft NTFS", usedFrac: 0.3),
+            mk("disk4s1", "SAMSUNG T7", 1000, ntfs: true, mounted: true, dev: "/dev/disk4s1",
+               fs: "Windows NTFS", content: "Windows_NTFS", eject: true, usedFrac: 0.58),
+            mk("disk5s1", "WD Elements", 15.16, ntfs: true, mounted: true, dev: "/dev/disk5s1",
+               fs: "Windows NTFS", ro: true, eject: true, usedFrac: 0.41),
+            mk("disk6s1", "Project Files", 499.93, ntfs: true, mounted: false, dev: "/dev/disk6s1",
+               fs: "Windows NTFS", eject: true, usedFrac: 0.62),
             mk("disk3s1", "", 0.5337, ntfs: false, mounted: false, dev: "/dev/disk3s1", fs: "EFI"),
-            mk("disk3s5", "Macintosh HD - Data", 210, ntfs: false, mounted: true,
-               dev: "/dev/disk3s5", fs: "APFS", nobrowse: true, usedFrac: 0.7),
-            mk("disk3s1b", "Macintosh HD", 210, ntfs: false, mounted: true, dev: "/dev/disk3s1",
-               fs: "APFS", ro: true, usedFrac: 0.7),
+            mk("disk3s5", "Macintosh HD — Data", 994, ntfs: false, mounted: true,
+               dev: "/dev/disk3s5", fs: "APFS", nobrowse: true, usedFrac: 0.46),
+            mk("disk3s3", "Macintosh HD", 994, ntfs: false, mounted: true, dev: "/dev/disk3s3",
+               fs: "APFS", ro: true, usedFrac: 0.12),
         ]
     }
 }
 
 // MARK: - Sidebar
 
+private struct MicroBar: View {
+    var fraction: Double
+    var ntfs: Bool
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.08))
+                Capsule()
+                    .fill(ntfs ? AnyShapeStyle(UI.ntfsGrad) : AnyShapeStyle(Color(0x59708a)))
+                    .frame(width: max(3, g.size.width * fraction))
+            }
+        }
+        .frame(height: 3)
+    }
+}
+
+private struct Badge: View {
+    let text: String; var kind: Kind = .neutral
+    enum Kind { case neutral, amber, rose }
+    var body: some View {
+        let (fg, bg): (Color, Color) = {
+            switch kind {
+            case .neutral: return (Color(0xc4d3e0), Color.white.opacity(0.10))
+            case .amber:   return (Color(0x3a2a06), UI.amber)
+            case .rose:    return (Color(0xfff0f0), UI.rose.opacity(0.85))
+            }
+        }()
+        return Text(text).font(.system(size: 9.5, weight: .semibold))
+            .foregroundStyle(fg)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(bg))
+    }
+}
+
 private struct VolumeRow: View {
     let v: VolumeItem
     let selected: Bool
     var body: some View {
         HStack(spacing: 11) {
-            Circle().fill(v.mounted ? UI.green : Color(0x7d6a3a))
-                .frame(width: 7, height: 7)
-            Image(systemName: v.ejectable ? "externaldrive.fill" : "internaldrive.fill")
-                .font(.system(size: 17))
-                .foregroundStyle(selected ? UI.text : Color(0xaeb8c6))
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(v.displayName).font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(UI.text).lineLimit(1)
-                Text(v.sizeText).font(.system(size: 11.5)).foregroundStyle(UI.dim)
+            ZStack {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(v.isNTFS ? AnyShapeStyle(UI.ntfsGrad)
+                                   : AnyShapeStyle(Color.white.opacity(0.08)))
+                    .frame(width: 30, height: 30)
+                Image(systemName: v.ejectable ? "externaldrive.fill" : "internaldrive.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(v.isNTFS ? .white : Color(0x9fb2c4))
+                if v.mounted {
+                    Circle().fill(UI.green)
+                        .frame(width: 8, height: 8)
+                        .overlay(Circle().stroke(UI.sidebar, lineWidth: 2))
+                        .offset(x: 12, y: 11)
+                }
             }
-            Spacer(minLength: 4)
-            if !v.writable { Badge("read-only") }
-            if v.nobrowse { Badge("nobrowse", amber: true) }
-            if v.ejectable {
-                Image(systemName: "eject.fill").font(.system(size: 12)).foregroundStyle(UI.dim)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(v.displayName).font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(UI.text).lineLimit(1)
+                    Spacer(minLength: 0)
+                    if !v.writable { Badge(text: "RO", kind: .rose) }
+                    if v.nobrowse { Badge(text: "hidden", kind: .amber) }
+                }
+                HStack(spacing: 6) {
+                    MicroBar(fraction: v.usedFraction, ntfs: v.isNTFS)
+                    Text(v.sizeText).font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(UI.faint).monospacedDigit()
+                }
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 9)
-        .background(RoundedRectangle(cornerRadius: 8).fill(selected ? UI.sel : .clear))
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 9)
+            .fill(selected ? Color.white.opacity(0.06) : .clear)
+            .overlay(alignment: .leading) {
+                if selected {
+                    Capsule().fill(UI.ntfsGrad).frame(width: 3, height: 20)
+                        .padding(.leading, 2)
+                }
+            })
         .contentShape(Rectangle())
-    }
-}
-
-private struct Badge: View {
-    let text: String; var amber = false
-    init(_ t: String, amber: Bool = false) { text = t; self.amber = amber }
-    var body: some View {
-        Text(text).font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(amber ? Color(0x3a2a06) : Color(0xc7d0db))
-            .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(RoundedRectangle(cornerRadius: 5)
-                .fill(amber ? UI.amber : Color.white.opacity(0.11)))
     }
 }
 
@@ -306,38 +334,34 @@ private struct Sidebar: View {
     @ObservedObject var store: VolumeStore
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 9) {
-                ZStack {
-                    Circle().fill(LinearGradient(colors: [Color(0x48566a), Color(0x333d4c)],
-                                                 startPoint: .top, endPoint: .bottom))
-                    Image(systemName: "person.fill").font(.system(size: 12))
-                        .foregroundStyle(Color(0xc7d0db))
-                }.frame(width: 26, height: 26)
-                Text("This Mac").font(.system(size: 14, weight: .semibold)).foregroundStyle(UI.text)
-                Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(UI.faint)
+            // brand
+            HStack(spacing: 10) {
+                DiskEmblem(size: 34)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Mntfs").font(.system(size: 17, weight: .bold)).foregroundStyle(UI.text)
+                    Text("NTFS for Mac").font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(UI.faint)
+                }
                 Spacer()
             }
-            .padding(.horizontal, 18).padding(.top, 16).padding(.bottom, 12)
-            .background(UI.sidebarTop)
+            .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 14)
+
+            Rectangle().fill(UI.line).frame(height: 1)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    section("NTFS Volumes", store.ntfs)
+                    section("NTFS Drives", store.ntfs)
                     section("Other Volumes", store.others)
-                }.padding(.bottom, 12)
+                }.padding(.top, 4).padding(.bottom, 12)
             }
 
-            Spacer(minLength: 0)
-            Divider().overlay(UI.line)
-            HStack(spacing: 11) {
-                DriveGraphic(size: 40).frame(width: 40, height: 34)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("FastNTFS").font(.system(size: 14, weight: .semibold)).foregroundStyle(UI.text)
-                    Text("NTFS for Mac").font(.system(size: 11)).foregroundStyle(UI.faint)
-                }
+            Rectangle().fill(UI.line).frame(height: 1)
+            HStack(spacing: 8) {
+                Circle().fill(UI.green).frame(width: 7, height: 7)
+                Text("Extension active").font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(UI.dim)
                 Spacer()
-            }.padding(.horizontal, 18).padding(.vertical, 12)
+            }.padding(.horizontal, 16).padding(.vertical, 11)
         }
         .background(UI.sidebar)
     }
@@ -345,74 +369,65 @@ private struct Sidebar: View {
     @ViewBuilder private func section(_ title: String, _ items: [VolumeItem]) -> some View {
         if !items.isEmpty {
             Text(title.uppercased())
-                .font(.system(size: 11, weight: .bold)).tracking(0.6)
+                .font(.system(size: 10.5, weight: .bold)).tracking(0.7)
                 .foregroundStyle(UI.faint)
-                .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 6)
-            VStack(spacing: 2) {
+                .padding(.horizontal, 18).padding(.top, 16).padding(.bottom, 7)
+            VStack(spacing: 3) {
                 ForEach(items) { v in
                     VolumeRow(v: v, selected: v.id == store.selectedID)
                         .onTapGesture { store.selectedID = v.id }
                 }
-            }.padding(.horizontal, 10)
+            }.padding(.horizontal, 8)
         }
     }
 }
 
 // MARK: - Detail
 
-private struct ToolButton: View {
-    let icon: String; let label: String; var tint: Color = UI.dim; var action: () -> Void = {}
+private struct PillButton: View {
+    let icon: String; let label: String
+    var prominent = false
+    var tint: Color = UI.text
+    var action: () -> Void = {}
+    @State private var hover = false
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 20)).frame(height: 24)
-                Text(label).font(.system(size: 11.5))
-            }.foregroundStyle(tint).frame(minWidth: 56)
-        }.buttonStyle(.plain)
+            HStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+                Text(label).font(.system(size: 12.5, weight: .medium))
+            }
+            .foregroundStyle(prominent ? Color(0x06222f) : tint)
+            .padding(.horizontal, 13).padding(.vertical, 7)
+            .background(
+                Capsule().fill(prominent ? AnyShapeStyle(UI.ntfsGrad)
+                                         : AnyShapeStyle(Color.white.opacity(hover ? 0.10 : 0.05)))
+            )
+            .overlay(Capsule().stroke(Color.white.opacity(prominent ? 0 : 0.09), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
     }
 }
 
 private struct InfoRow: View {
-    let k: String; let v: String; var link = false; var mounted = false
+    let k: String; let v: String; var link = false; var good = false
     var body: some View {
-        HStack(spacing: 8) {
-            Text(k).font(.system(size: 13.5)).foregroundStyle(UI.dim)
-                .frame(width: 150, alignment: .leading)
-            if mounted {
-                HStack(spacing: 7) {
-                    Circle().fill(UI.green).frame(width: 8, height: 8)
-                    Text(v).foregroundStyle(UI.text)
-                }.font(.system(size: 13.5))
+        HStack(spacing: 10) {
+            Text(k).font(.system(size: 12.5)).foregroundStyle(UI.dim)
+                .frame(width: 118, alignment: .leading)
+            if good {
+                HStack(spacing: 6) {
+                    Circle().fill(UI.green).frame(width: 7, height: 7)
+                    Text(v)
+                }.font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.text)
             } else {
-                Text(v).font(.system(size: 13.5)).foregroundStyle(link ? UI.link : UI.text)
+                Text(v).font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(link ? UI.accent : UI.text)
             }
             Spacer()
         }
-        .padding(.vertical, 9)
+        .padding(.vertical, 8)
         .overlay(alignment: .bottom) { Rectangle().fill(UI.line).frame(height: 1) }
-    }
-}
-
-private struct OptionRow: View {
-    let label: String; @Binding var on: Bool
-    var body: some View {
-        Button { on.toggle() } label: {
-            HStack(spacing: 11) {
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(on ? UI.accent : Color.white.opacity(0.05))
-                    .overlay(RoundedRectangle(cornerRadius: 5)
-                        .stroke(on ? UI.accent : Color.white.opacity(0.22), lineWidth: 1))
-                    .frame(width: 19, height: 19)
-                    .overlay {
-                        if on {
-                            Image(systemName: "checkmark").font(.system(size: 11, weight: .heavy))
-                                .foregroundStyle(Color(0x062430))
-                        }
-                    }
-                Text(label).font(.system(size: 14)).foregroundStyle(on ? UI.text : UI.dim)
-                Spacer()
-            }
-        }.buttonStyle(.plain)
     }
 }
 
@@ -424,98 +439,119 @@ private struct DetailPane: View {
     @State private var noAuto = false
 
     var body: some View {
-        let v = store.selected
-        VStack(alignment: .leading, spacing: 0) {
-            // toolbar
-            HStack(spacing: 34) {
-                ToolButton(icon: "eject.fill", label: (v?.mounted ?? true) ? "Unmount" : "Mount") {
-                    if let v { store.toggleMount(v) }
-                }
-                ToolButton(icon: "checkmark.circle", label: "Verify", tint: UI.green)
-                ToolButton(icon: "eraser.fill", label: "Erase")
-                ToolButton(icon: "flag.checkered", label: "Startup")
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .overlay(alignment: .bottom) { Rectangle().fill(UI.line).frame(height: 1) }
-
-            if let v {
-                content(v).padding(.horizontal, 34).padding(.top, 26)
+        Group {
+            if let v = store.selected {
+                content(v)
             } else {
-                Spacer(); Text("No volume selected").foregroundStyle(UI.dim); Spacer()
+                VStack { Spacer(); Text("Select a volume").foregroundStyle(UI.dim); Spacer() }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(LinearGradient(colors: [UI.detailA, UI.detailB],
                                    startPoint: .topLeading, endPoint: .bottomTrailing))
     }
 
     @ViewBuilder private func content(_ v: VolumeItem) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 30) {
-                DriveGraphic(size: 210)
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 10) {
-                        Text(v.displayName).font(.system(size: 30, weight: .bold))
+            // header: title + actions
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 9) {
+                        Text(v.displayName).font(.system(size: 26, weight: .bold))
                             .foregroundStyle(UI.text)
-                        Image(systemName: "pencil").font(.system(size: 15)).foregroundStyle(UI.faint)
-                    }.padding(.bottom, 16)
-                    VStack(spacing: 0) {
-                        InfoRow(k: "Mounted", v: v.mounted ? "Yes" : "No", mounted: v.mounted)
-                        InfoRow(k: "Device", v: v.device)
-                        InfoRow(k: "File System", v: v.fileSystem.isEmpty ? "—" : v.fileSystem)
-                        InfoRow(k: "Mount Point", v: v.mountPoint ?? "Not mounted",
-                                link: v.mounted)
+                        Image(systemName: "pencil").font(.system(size: 13))
+                            .foregroundStyle(UI.faint)
                     }
-                    .padding(.horizontal, 18)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(UI.card)
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(UI.line, lineWidth: 1)))
-                    .frame(maxWidth: 560)
+                    Text(v.fileSystem.isEmpty ? "Unknown format" : v.fileSystem)
+                        .font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.dim)
+                }
+                Spacer()
+                HStack(spacing: 9) {
+                    PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
+                               label: v.mounted ? "Unmount" : "Mount", prominent: true) {
+                        store.toggleMount(v)
+                    }
+                    PillButton(icon: "checkmark.shield", label: "Verify")
+                    PillButton(icon: "trash", label: "Erase")
                 }
             }
+            .padding(.horizontal, 34).padding(.top, 26).padding(.bottom, 22)
+            .overlay(alignment: .bottom) { Rectangle().fill(UI.line).frame(height: 1) }
 
-            usage(v).padding(.top, 30)
-
-            VStack(alignment: .leading, spacing: 14) {
-                OptionRow(label: "Save Last Access Time", on: $saveAccess)
-                OptionRow(label: "Enable Spotlight Indexing", on: $spotlight)
-                OptionRow(label: "Mount in Read-only mode", on: $readOnly)
-                OptionRow(label: "Do not mount automatically", on: $noAuto)
-            }.padding(.top, 34)
-        }
-    }
-
-    @ViewBuilder private func usage(_ v: VolumeItem) -> some View {
-        let frac = v.sizeBytes > 0 ? Double(v.usedBytes) / Double(v.sizeBytes) : 0
-        VStack(alignment: .leading, spacing: 9) {
-            HStack {
-                label(ByteCount.string(v.sizeBytes), "Total")
-                Spacer()
-                label(ByteCount.string(v.usedBytes), "Used")
-                Spacer()
-                label(ByteCount.string(v.freeBytes), "Free")
-            }.frame(maxWidth: 620)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.09))
-                    Capsule().fill(LinearGradient(colors: [Color(0x2f8fe0), Color(0x4aa8ec)],
-                                                  startPoint: .leading, endPoint: .trailing))
-                        .frame(width: max(6, geo.size.width * frac))
+            // hero: capacity ring + info
+            HStack(alignment: .top, spacing: 44) {
+                VStack(spacing: 14) {
+                    CapacityRing(fraction: v.usedFraction, size: 168)
+                    VStack(spacing: 3) {
+                        Text("\(Int((v.usedFraction * 100).rounded()))%")
+                            .font(.system(size: 20, weight: .bold)).foregroundStyle(UI.text)
+                        Text("used").font(.system(size: 11.5)).foregroundStyle(UI.faint)
+                    }
                 }
-            }.frame(height: 11)
-            HStack(spacing: 9) {
-                Circle().fill(Color(0x3f9be6)).frame(width: 9, height: 9)
-                Text("Used").foregroundStyle(UI.dim)
-                Text(ByteCount.string(v.usedBytes)).foregroundStyle(UI.text).fontWeight(.semibold)
-            }.font(.system(size: 13)).padding(.top, 6)
+                .frame(width: 200)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    InfoRow(k: "Status", v: v.mounted ? "Mounted" : "Not mounted", good: v.mounted)
+                    InfoRow(k: "Device", v: v.device)
+                    InfoRow(k: "Format", v: v.fileSystem.isEmpty ? "—" : v.fileSystem)
+                    InfoRow(k: "Location", v: v.mountPoint ?? "—", link: v.mounted)
+                    capacityLegend(v).padding(.top, 16)
+                }
+                .frame(maxWidth: 520, alignment: .leading)
+            }
+            .padding(.horizontal, 34).padding(.top, 30)
+
+            // mount options
+            Text("MOUNT OPTIONS").font(.system(size: 10.5, weight: .bold)).tracking(0.7)
+                .foregroundStyle(UI.faint)
+                .padding(.horizontal, 34).padding(.top, 34).padding(.bottom, 4)
+            VStack(spacing: 0) {
+                toggleRow("Save last access time", $saveAccess)
+                toggleRow("Enable Spotlight indexing", $spotlight)
+                toggleRow("Mount as read-only", $readOnly)
+                toggleRow("Skip automatic mounting", $noAuto)
+            }
+            .padding(.horizontal, 18)
+            .background(RoundedRectangle(cornerRadius: 12).fill(UI.card)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(UI.line, lineWidth: 1)))
+            .padding(.horizontal, 34)
+
+            Spacer(minLength: 20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func capacityLegend(_ v: VolumeItem) -> some View {
+        HStack(spacing: 22) {
+            legend(UI.accent, "Used", ByteCount.string(v.usedBytes))
+            legend(Color.white.opacity(0.14), "Free", ByteCount.string(v.freeBytes))
+            legend(.clear, "Total", ByteCount.string(v.sizeBytes))
         }
     }
 
-    private func label(_ value: String, _ k: String) -> some View {
-        HStack(spacing: 5) {
-            Text(value).font(.system(size: 13, weight: .semibold)).foregroundStyle(UI.text)
-            Text(k).font(.system(size: 13)).foregroundStyle(UI.dim)
+    private func legend(_ c: Color, _ k: String, _ val: String) -> some View {
+        HStack(spacing: 7) {
+            if c != .clear {
+                RoundedRectangle(cornerRadius: 3).fill(c).frame(width: 10, height: 10)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(k).font(.system(size: 10.5)).foregroundStyle(UI.faint)
+                Text(val).font(.system(size: 13, weight: .semibold)).foregroundStyle(UI.text)
+                    .monospacedDigit()
+            }
+        }
+    }
+
+    private func toggleRow(_ label: String, _ bind: Binding<Bool>) -> some View {
+        Toggle(isOn: bind) {
+            Text(label).font(.system(size: 13.5)).foregroundStyle(UI.text)
+        }
+        .toggleStyle(.switch).tint(UI.accent)
+        .padding(.vertical, 11)
+        .overlay(alignment: .bottom) {
+            if label != "Skip automatic mounting" {
+                Rectangle().fill(UI.line).frame(height: 1)
+            }
         }
     }
 }
@@ -526,10 +562,11 @@ struct ContentView: View {
     @StateObject private var store = VolumeStore()
     var body: some View {
         HStack(spacing: 0) {
-            Sidebar(store: store).frame(width: 300)
+            Sidebar(store: store).frame(width: 288)
             DetailPane(store: store)
         }
-        .frame(minWidth: 1000, minHeight: 660)
+        .frame(minWidth: 1000, minHeight: 640)
+        .background(UI.appBG)
         .preferredColorScheme(.dark)
     }
 }
