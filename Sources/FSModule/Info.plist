@@ -17,7 +17,48 @@
 			<string>fnqy</string>
 		</dict>
 		<key>FSMediaTypes</key>
-		<dict/>
+		<dict>
+			<!-- MBR partition type: classic NTFS USB drives.
+			     Beat Apple's read-only ntfs handler (order 1000). -->
+			<key>Windows_NTFS</key>
+			<dict>
+				<key>FSMediaProperties</key>
+				<dict>
+					<key>Content Hint</key>
+					<string>Windows_NTFS</string>
+					<key>Leaf</key>
+					<true/>
+				</dict>
+				<key>FSProbeOrder</key>
+				<integer>500</integer>
+			</dict>
+			<!-- GPT: Microsoft Basic Data. Probe rejects non-NTFS quickly. -->
+			<key>EBD0A0A2-B9E5-4433-87C0-68B6B72699C7</key>
+			<dict>
+				<key>FSMediaProperties</key>
+				<dict>
+					<key>Content Hint</key>
+					<string>EBD0A0A2-B9E5-4433-87C0-68B6B72699C7</string>
+					<key>Leaf</key>
+					<true/>
+				</dict>
+				<key>FSProbeOrder</key>
+				<integer>1500</integer>
+			</dict>
+			<!-- Partitionless media (raw disk images, superfloppy drives). -->
+			<key>Partitionless</key>
+			<dict>
+				<key>FSMediaProperties</key>
+				<dict>
+					<key>Leaf</key>
+					<true/>
+					<key>Whole</key>
+					<true/>
+				</dict>
+				<key>FSProbeOrder</key>
+				<integer>3000</integer>
+			</dict>
+		</dict>
 		<key>FSPersonalities</key>
 		<dict>
 			<key>Mntfs</key>
