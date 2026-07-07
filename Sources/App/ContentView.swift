@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import AppKit
 
 // MARK: - Palette
 
@@ -83,10 +84,34 @@ struct DiskEmblem: View {
     }
 }
 
-/// Capacity ring — the hero. Maclife-gradient arc over a faint track.
+/// The real macOS drive icon for a volume (Finder icon when mounted),
+/// falling back to an SF Symbol drive when the volume isn't mounted.
+struct VolumeGlyph: View {
+    let volume: VolumeItem
+    let size: CGFloat
+    var body: some View {
+        if let img = Self.finderIcon(volume) {
+            Image(nsImage: img).resizable().interpolation(.high).scaledToFit()
+                .frame(width: size, height: size)
+        } else {
+            Image(systemName: volume.ejectable ? "externaldrive.fill" : "internaldrive.fill")
+                .font(.system(size: size * 0.5, weight: .regular))
+                .foregroundStyle(Color(0xaab8c6))
+                .frame(width: size, height: size)
+        }
+    }
+    static func finderIcon(_ v: VolumeItem) -> NSImage? {
+        guard let mp = v.mountPoint else { return nil }
+        return NSWorkspace.shared.icon(forFile: mp)
+    }
+}
+
+/// Capacity ring — the hero. Maclife-gradient arc over a faint track, with the
+/// macOS drive icon at its centre.
 struct CapacityRing: View {
     var fraction: Double
     var size: CGFloat
+    var volume: VolumeItem
     var body: some View {
         let lw = size * 0.085
         ZStack {
@@ -95,7 +120,7 @@ struct CapacityRing: View {
                 .trim(from: 0, to: max(0.004, min(1, fraction)))
                 .stroke(UI.ringGrad, style: StrokeStyle(lineWidth: lw, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-            DiskEmblem(size: size * 0.44)
+            VolumeGlyph(volume: volume, size: size * 0.46)
         }
         .frame(width: size, height: size)
     }
@@ -141,11 +166,13 @@ final class VolumeStore: ObservableObject {
     @Published var scanning = false
     @Published var usingSampleData = false
     @Published var actionMessage: String?
+    @Published var extensionActive = true
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
     init() {
         refresh()
+        checkExtension()
         let nc = NSWorkspace.shared.notificationCenter
         for name: NSNotification.Name in [.init("NSWorkspaceDidMountNotification"),
                                           .init("NSWorkspaceDidUnmountNotification"),
@@ -158,10 +185,37 @@ final class VolumeStore: ObservableObject {
 
     func refresh() {
         scanning = true
+        checkExtension()
         Task.detached(priority: .userInitiated) {
             let all = Self.enumerate()
             await MainActor.run { self.apply(all) }
         }
+    }
+
+    /// Ask pluginkit whether our FSKit module is enabled ("+" prefix = enabled).
+    func checkExtension() {
+        Task.detached(priority: .utility) {
+            let active = Self.extensionEnabled()
+            await MainActor.run { self.extensionActive = active }
+        }
+    }
+
+    nonisolated private static func extensionEnabled() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
+        p.arguments = ["-m", "-i", "com.fastntfs.FastNTFS.FSModule"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        do { try p.run() } catch { return false }
+        let d = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard let s = String(data: d, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return false }
+        return s.hasPrefix("+")
+    }
+
+    func openExtensionSettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule")!
+        NSWorkspace.shared.open(url)
     }
 
     private func apply(_ all: [VolumeItem]) {
@@ -429,14 +483,43 @@ private struct Sidebar: View {
             }
 
             Rectangle().fill(UI.line).frame(height: 1)
+            extensionStatus
+        }
+        .background(UI.sidebar)
+    }
+
+    @ViewBuilder private var extensionStatus: some View {
+        if store.extensionActive {
             HStack(spacing: 8) {
                 Circle().fill(UI.green).frame(width: 7, height: 7)
                 Text("Extension active").font(.system(size: 11, weight: .medium))
                     .foregroundStyle(UI.dim)
                 Spacer()
-            }.padding(.horizontal, 16).padding(.vertical, 11)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 11)
+        } else {
+            Button { store.openExtensionSettings() } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12)).foregroundStyle(UI.amber)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Extension not enabled")
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(UI.text)
+                        Text("NTFS disks won't mount — click to enable")
+                            .font(.system(size: 10)).foregroundStyle(UI.faint)
+                            .lineLimit(1).minimumScaleFactor(0.85)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(UI.faint)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(UI.amber.opacity(0.13))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Open File System Extensions settings")
         }
-        .background(UI.sidebar)
     }
 
     @ViewBuilder private func section(_ title: String, _ items: [VolumeItem]) -> some View {
@@ -543,10 +626,12 @@ private struct DetailPane: View {
                 }
                 Spacer()
                 HStack(spacing: 9) {
-                    PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
-                               label: v.mounted ? "Unmount" : "Mount", prominent: true,
-                               disabled: v.mountPoint == "/") {
-                        store.toggleMount(v)
+                    // The boot volume at "/" can't be unmounted; hide the control.
+                    if v.mountPoint != "/" {
+                        PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
+                                   label: v.mounted ? "Unmount" : "Mount", prominent: true) {
+                            store.toggleMount(v)
+                        }
                     }
                     PillButton(icon: "checkmark.shield", label: "Verify") {
                         store.verify(v)
@@ -562,7 +647,7 @@ private struct DetailPane: View {
             // hero: capacity ring + info
             HStack(alignment: .top, spacing: 44) {
                 VStack(spacing: 14) {
-                    CapacityRing(fraction: v.usedFraction, size: 168)
+                    CapacityRing(fraction: v.usedFraction, size: 168, volume: v)
                     VStack(spacing: 3) {
                         Text("\(Int((v.usedFraction * 100).rounded()))%")
                             .font(.system(size: 20, weight: .bold)).foregroundStyle(UI.text)
@@ -585,19 +670,22 @@ private struct DetailPane: View {
             // mount options
             Text("MOUNT OPTIONS").font(.system(size: 10.5, weight: .bold)).tracking(0.7)
                 .foregroundStyle(UI.faint)
-                .padding(.horizontal, 34).padding(.top, 34).padding(.bottom, 4)
+                .padding(.horizontal, 34).padding(.top, 34).padding(.bottom, 8)
             VStack(spacing: 0) {
-                toggleRow("Save last access time", $saveAccess)
-                toggleRow("Enable Spotlight indexing", $spotlight)
-                toggleRow("Mount as read-only", $readOnly)
-                toggleRow("Skip automatic mounting", $noAuto)
+                optionRow("clock.arrow.circlepath", "Save last access time", $saveAccess)
+                optionSep()
+                optionRow("magnifyingglass", "Enable Spotlight indexing", $spotlight)
+                optionSep()
+                optionRow("lock", "Mount as read-only", $readOnly)
+                optionSep()
+                optionRow("bolt.slash", "Skip automatic mounting", $noAuto)
             }
-            .padding(.horizontal, 18)
             .background(RoundedRectangle(cornerRadius: 12).fill(UI.card)
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(UI.line, lineWidth: 1)))
+            .frame(maxWidth: 460, alignment: .leading)
             .padding(.horizontal, 34)
 
-            Spacer(minLength: 20)
+            Spacer(minLength: 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -623,17 +711,20 @@ private struct DetailPane: View {
         }
     }
 
-    private func toggleRow(_ label: String, _ bind: Binding<Bool>) -> some View {
-        Toggle(isOn: bind) {
+    private func optionRow(_ icon: String, _ label: String, _ bind: Binding<Bool>) -> some View {
+        HStack(spacing: 13) {
+            Image(systemName: icon).font(.system(size: 13))
+                .foregroundStyle(UI.dim).frame(width: 20)
             Text(label).font(.system(size: 13.5)).foregroundStyle(UI.text)
+            Spacer(minLength: 16)
+            Toggle("", isOn: bind).labelsHidden().toggleStyle(.switch).tint(UI.accent)
+                .controlSize(.small)
         }
-        .toggleStyle(.switch).tint(UI.accent)
-        .padding(.vertical, 11)
-        .overlay(alignment: .bottom) {
-            if label != "Skip automatic mounting" {
-                Rectangle().fill(UI.line).frame(height: 1)
-            }
-        }
+        .padding(.horizontal, 14).padding(.vertical, 11)
+    }
+
+    private func optionSep() -> some View {
+        Rectangle().fill(UI.line).frame(height: 1).padding(.leading, 47)
     }
 }
 
