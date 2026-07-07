@@ -176,6 +176,8 @@ final class VolumeStore: ObservableObject {
     @Published var actionMessage: String?
     @Published var extensionActive = true
     @Published var verifying = false
+    @Published var erasing = false
+    @Published var eraseTarget: VolumeItem?
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
@@ -336,6 +338,61 @@ final class VolumeStore: ObservableObject {
         }
     }
 
+    // MARK: Erase / reformat as NTFS
+
+    func erase(_ v: VolumeItem, newName: String) {
+        erasing = true
+        Task.detached(priority: .userInitiated) {
+            let result = Self.performErase(device: v.device, name: newName)
+            await MainActor.run {
+                self.erasing = false
+                self.eraseTarget = nil
+                self.actionMessage = result
+                self.refresh()
+            }
+        }
+    }
+
+    nonisolated private static func shQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    nonisolated private static func performErase(device: String, name: String) -> String {
+        guard let mkntfs = Bundle.main.path(forResource: "mkntfs", ofType: nil) else {
+            return "Erase failed: the mkntfs formatter is missing from the app bundle."
+        }
+        // Best-effort unmount so mkntfs can take the raw partition.
+        _ = run(["unmount", device])
+
+        // Sanitize the label; mkntfs -Q quick-formats, -F forces past warnings.
+        let label = String(name.prefix(32)).filter { $0 != "\"" && $0 != "'" && $0 != "\\" }
+        let shell = "\(shQuote(mkntfs)) -Q -F -L \(shQuote(label)) \(shQuote(device))"
+        let esc = shell.replacingOccurrences(of: "\\", with: "\\\\")
+                       .replacingOccurrences(of: "\"", with: "\\\"")
+        let appleScript = "do shell script \"\(esc)\" with administrator privileges"
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", appleScript]
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
+        do { try p.run() } catch { return "Erase failed: \(error.localizedDescription)" }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let outText = (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Remount so the freshly-formatted volume reappears.
+        _ = run(["mount", device])
+
+        if p.terminationStatus == 0 {
+            return "Reformatted \(device) as NTFS “\(label)”."
+        }
+        if outText.contains("-128") || outText.localizedCaseInsensitiveContains("cancel") {
+            return "Erase cancelled."
+        }
+        return "Erase failed:\n\(outText)"
+    }
+
     nonisolated private static func sample() -> [VolumeItem] {
         func mk(_ id: String, _ n: String, _ gb: Double, ntfs: Bool, mounted: Bool,
                 dev: String, fs: String, content: String = "", ro: Bool = false,
@@ -424,10 +481,10 @@ private struct VolumeRow: View {
                     Text(v.displayName).font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(UI.text).lineLimit(1)
                     Spacer(minLength: 0)
-                    if v.readOnly {
-                        Image(systemName: "lock.fill").font(.system(size: 10.5))
-                            .foregroundStyle(Color(0xff8f8f)).help("Read-only")
-                    }
+                    Image(systemName: v.readOnly ? "lock.fill" : "square.and.pencil")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(v.readOnly ? Color(0xff8f8f) : Color(0x62e6a4))
+                        .help(v.readOnly ? "Read-only" : "Read & Write")
                     if v.nobrowse { Badge(text: "hidden", kind: .amber) }
                 }
                 HStack(spacing: 6) {
@@ -684,6 +741,13 @@ private struct DetailPane: View {
                                busy: store.verifying) {
                         store.verify(v)
                     }
+                    // Reformatting as NTFS only makes sense for a removable NTFS
+                    // volume — never the boot disk.
+                    if v.isNTFS && v.mountPoint != "/" {
+                        PillButton(icon: "trash", label: "Erase") {
+                            store.eraseTarget = v
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 34).padding(.top, 26).padding(.bottom, 22)
@@ -761,6 +825,65 @@ struct ContentView: View {
         } message: {
             Text(store.actionMessage ?? "")
         }
+        .sheet(item: Binding(get: { store.eraseTarget },
+                             set: { store.eraseTarget = $0 })) { target in
+            EraseSheet(volume: target, erasing: store.erasing,
+                       onErase: { store.erase(target, newName: $0) },
+                       onCancel: { store.eraseTarget = nil })
+        }
+    }
+}
+
+/// Destructive reformat dialog. Requires an explicit volume-name confirmation.
+private struct EraseSheet: View {
+    let volume: VolumeItem
+    let erasing: Bool
+    let onErase: (String) -> Void
+    let onCancel: () -> Void
+    @State private var name: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 30)).foregroundStyle(Color(0xf5a623))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Erase “\(volume.displayName)”?")
+                        .font(.system(size: 16, weight: .bold))
+                    Text("This permanently deletes everything on \(volume.device) and "
+                         + "reformats it as NTFS. This cannot be undone.")
+                        .font(.system(size: 12.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("NEW VOLUME NAME").font(.system(size: 10, weight: .bold)).tracking(0.6)
+                    .foregroundStyle(.secondary)
+                TextField("Untitled", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(erasing)
+                Text("Format: Windows NTFS").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 10) {
+                if erasing {
+                    ProgressView().controlSize(.small)
+                    Text("Erasing… (you may be asked for your password)")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel", action: onCancel).disabled(erasing)
+                Button(role: .destructive) { onErase(name) } label: {
+                    Text("Erase").frame(minWidth: 60)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(erasing || name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 440)
+        .onAppear { name = volume.displayName }
     }
 }
 

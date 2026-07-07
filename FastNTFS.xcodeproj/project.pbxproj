@@ -15,6 +15,7 @@
 		AA0000000000000000000214 /* NTFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000114 /* NTFSItem.swift */; };
 		AA0000000000000000000215 /* BlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000115 /* BlockDevice.swift */; };
 		AA0000000000000000000216 /* fntfs.c in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000116 /* fntfs.c */; };
+		AA0000000000000000000217 /* mkntfs in Resources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000011B /* mkntfs */; };
 		AA0000000000000000000221 /* FastNTFSFSModule.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000022 /* FastNTFSFSModule.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -58,6 +59,7 @@
 		AA0000000000000000000118 /* BridgingHeader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BridgingHeader.h; sourceTree = "<group>"; };
 		AA0000000000000000000119 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA000000000000000000011A /* FSModule.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSModule.entitlements; sourceTree = "<group>"; };
+		AA000000000000000000011B /* mkntfs */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = Resources/mkntfs; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -101,6 +103,7 @@
 				AA0000000000000000000101 /* FastNTFSApp.swift */,
 				AA0000000000000000000102 /* ContentView.swift */,
 				AA0000000000000000000103 /* FastNTFS.entitlements */,
+				AA000000000000000000011B /* mkntfs */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -146,6 +149,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = AA0000000000000000000701 /* Build configuration list for PBXNativeTarget "FastNTFS" */;
 			buildPhases = (
+				AA0000000000000000000803 /* Resources */,
 				AA0000000000000000000801 /* Sources */,
 				AA0000000000000000000501 /* Frameworks */,
 				AA0000000000000000000401 /* Embed ExtensionKit Extensions */,
@@ -212,6 +216,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AA0000000000000000000803 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA0000000000000000000217 /* mkntfs in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AA0000000000000000000801 /* Sources */ = {

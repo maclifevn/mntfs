@@ -8,3 +8,6 @@ vendor/ntfs-3g/**/*.lo
 vendor/ntfs-3g/config.log
 vendor/ntfs-3g/build.log
 vendor/ntfs-3g/configure.log
+
+# Bundled formatter — reproduced by scripts/build-vendor.sh
+Sources/App/Resources/mkntfs
