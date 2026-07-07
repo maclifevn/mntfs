@@ -138,39 +138,62 @@ final class VolumeStore: ObservableObject {
     @Published var ntfs: [VolumeItem] = []
     @Published var others: [VolumeItem] = []
     @Published var selectedID: String?
+    @Published var scanning = false
+    @Published var usingSampleData = false
+    @Published var actionMessage: String?
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
-    init() { refresh() }
+    init() {
+        refresh()
+        let nc = NSWorkspace.shared.notificationCenter
+        for name: NSNotification.Name in [.init("NSWorkspaceDidMountNotification"),
+                                          .init("NSWorkspaceDidUnmountNotification"),
+                                          .init("NSWorkspaceDidRenameVolumeNotification")] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
+            }
+        }
+    }
 
     func refresh() {
-        let all = Self.enumerate()
+        scanning = true
+        Task.detached(priority: .userInitiated) {
+            let all = Self.enumerate()
+            await MainActor.run { self.apply(all) }
+        }
+    }
+
+    private func apply(_ all: [VolumeItem]) {
+        usingSampleData = all.isEmpty
         let items = all.isEmpty ? Self.sample() : all
         ntfs = items.filter { $0.isNTFS }
         others = items.filter { !$0.isNTFS }
         if selectedID == nil || !items.contains(where: { $0.id == selectedID }) {
             selectedID = ntfs.first?.id ?? others.first?.id
         }
+        scanning = false
     }
 
-    private static func run(_ args: [String]) -> Data? {
+    @discardableResult
+    nonisolated private static func run(_ args: [String]) -> Data? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
         p.arguments = args
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
         do { try p.run() } catch { return nil }
         let d = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return d.isEmpty ? nil : d
     }
 
-    private static func plist(_ d: Data?) -> [String: Any]? {
+    nonisolated private static func plist(_ d: Data?) -> [String: Any]? {
         guard let d else { return nil }
         return (try? PropertyListSerialization.propertyList(from: d, options: [], format: nil))
             as? [String: Any]
     }
 
-    private static func enumerate() -> [VolumeItem] {
+    nonisolated private static func enumerate() -> [VolumeItem] {
         guard let list = plist(run(["list", "-plist"])),
               let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
         var ids: [String] = []
@@ -204,7 +227,15 @@ final class VolumeStore: ObservableObject {
                 free = (a[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
                 used = max(0, total - free)
             }
+            let browsable = mount == "/" || (mount?.hasPrefix("/Volumes") ?? false)
             let nobrowse = mount.map { !$0.hasPrefix("/Volumes") && $0 != "/" } ?? false
+
+            // Keep the list useful: every NTFS disk (mounted or not, so it can
+            // be mounted), plus normal browsable volumes. Hide the APFS system
+            // helpers (Preboot/Recovery/VM/Update/iSCPreboot/xART/Hardware),
+            // EFI, and other nobrowse system volumes.
+            guard isNTFS || browsable else { continue }
+
             items.append(VolumeItem(
                 id: id, name: name, sizeBytes: size, device: dev, fileSystem: fs,
                 content: content, mountPoint: mount, writable: writable,
@@ -215,11 +246,30 @@ final class VolumeStore: ObservableObject {
     }
 
     func toggleMount(_ v: VolumeItem) {
-        _ = Self.run([v.mounted ? "unmount" : "mount", v.device])
-        refresh()
+        let mounting = !v.mounted
+        Task.detached(priority: .userInitiated) {
+            let out = Self.run([mounting ? "mount" : "unmount", v.device])
+            let text = out.flatMap { String(data: $0, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            await MainActor.run {
+                if !text.isEmpty, text.localizedCaseInsensitiveContains("failed")
+                    || text.localizedCaseInsensitiveContains("could not") {
+                    self.actionMessage = text
+                }
+                self.refresh()
+            }
+        }
     }
 
-    private static func sample() -> [VolumeItem] {
+    func verify(_ v: VolumeItem) {
+        Task.detached(priority: .userInitiated) {
+            let out = Self.run(["verifyVolume", v.device])
+            let text = out.flatMap { String(data: $0, encoding: .utf8) } ?? "No output."
+            await MainActor.run { self.actionMessage = text }
+        }
+    }
+
+    nonisolated private static func sample() -> [VolumeItem] {
         func mk(_ id: String, _ n: String, _ gb: Double, ntfs: Bool, mounted: Bool,
                 dev: String, fs: String, content: String = "", ro: Bool = false,
                 eject: Bool = false, nobrowse: Bool = false, usedFrac: Double = 0.5) -> VolumeItem {
@@ -343,10 +393,33 @@ private struct Sidebar: View {
                         .foregroundStyle(UI.faint)
                 }
                 Spacer()
+                Button { store.refresh() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(UI.dim)
+                        .rotationEffect(.degrees(store.scanning ? 360 : 0))
+                        .animation(store.scanning
+                            ? .linear(duration: 0.8).repeatForever(autoreverses: false)
+                            : .default, value: store.scanning)
+                }
+                .buttonStyle(.plain)
+                .help("Rescan volumes")
             }
             .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 14)
 
             Rectangle().fill(UI.line).frame(height: 1)
+
+            if store.usingSampleData {
+                HStack(spacing: 7) {
+                    Image(systemName: "info.circle.fill").font(.system(size: 10))
+                    Text("Sample data — no volumes detected")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .foregroundStyle(UI.amber)
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(UI.amber.opacity(0.10))
+            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -387,6 +460,7 @@ private struct Sidebar: View {
 private struct PillButton: View {
     let icon: String; let label: String
     var prominent = false
+    var disabled = false
     var tint: Color = UI.text
     var action: () -> Void = {}
     @State private var hover = false
@@ -405,7 +479,9 @@ private struct PillButton: View {
             .overlay(Capsule().stroke(Color.white.opacity(prominent ? 0 : 0.09), lineWidth: 1))
         }
         .buttonStyle(.plain)
-        .onHover { hover = $0 }
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1)
+        .onHover { hover = $0 && !disabled }
     }
 }
 
@@ -468,11 +544,16 @@ private struct DetailPane: View {
                 Spacer()
                 HStack(spacing: 9) {
                     PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
-                               label: v.mounted ? "Unmount" : "Mount", prominent: true) {
+                               label: v.mounted ? "Unmount" : "Mount", prominent: true,
+                               disabled: v.mountPoint == "/") {
                         store.toggleMount(v)
                     }
-                    PillButton(icon: "checkmark.shield", label: "Verify")
-                    PillButton(icon: "trash", label: "Erase")
+                    PillButton(icon: "checkmark.shield", label: "Verify") {
+                        store.verify(v)
+                    }
+                    PillButton(icon: "trash", label: "Erase") {
+                        store.actionMessage = "Erasing volumes isn't available in this build yet."
+                    }
                 }
             }
             .padding(.horizontal, 34).padding(.top, 26).padding(.bottom, 22)
@@ -568,6 +649,13 @@ struct ContentView: View {
         .frame(minWidth: 1000, minHeight: 640)
         .background(UI.appBG)
         .preferredColorScheme(.dark)
+        .alert("Mntfs", isPresented: Binding(
+            get: { store.actionMessage != nil },
+            set: { if !$0 { store.actionMessage = nil } })) {
+            Button("OK", role: .cancel) { store.actionMessage = nil }
+        } message: {
+            Text(store.actionMessage ?? "")
+        }
     }
 }
 
