@@ -167,6 +167,7 @@ final class VolumeStore: ObservableObject {
     @Published var usingSampleData = false
     @Published var actionMessage: String?
     @Published var extensionActive = true
+    @Published var verifying = false
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
@@ -316,10 +317,14 @@ final class VolumeStore: ObservableObject {
     }
 
     func verify(_ v: VolumeItem) {
+        verifying = true
         Task.detached(priority: .userInitiated) {
             let out = Self.run(["verifyVolume", v.device])
             let text = out.flatMap { String(data: $0, encoding: .utf8) } ?? "No output."
-            await MainActor.run { self.actionMessage = text }
+            await MainActor.run {
+                self.verifying = false
+                self.actionMessage = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
     }
 
@@ -544,13 +549,19 @@ private struct PillButton: View {
     let icon: String; let label: String
     var prominent = false
     var disabled = false
+    var busy = false
     var tint: Color = UI.text
     var action: () -> Void = {}
     @State private var hover = false
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+                if busy {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                        .frame(width: 12, height: 12).tint(tint)
+                } else {
+                    Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+                }
                 Text(label).font(.system(size: 12.5, weight: .medium))
             }
             .foregroundStyle(prominent ? Color(0x06222f) : tint)
@@ -562,9 +573,9 @@ private struct PillButton: View {
             .overlay(Capsule().stroke(Color.white.opacity(prominent ? 0 : 0.09), lineWidth: 1))
         }
         .buttonStyle(.plain)
-        .disabled(disabled)
+        .disabled(disabled || busy)
         .opacity(disabled ? 0.4 : 1)
-        .onHover { hover = $0 && !disabled }
+        .onHover { hover = $0 && !disabled && !busy }
     }
 }
 
@@ -592,10 +603,6 @@ private struct InfoRow: View {
 
 private struct DetailPane: View {
     @ObservedObject var store: VolumeStore
-    @State private var saveAccess = true
-    @State private var spotlight = false
-    @State private var readOnly = false
-    @State private var noAuto = false
 
     var body: some View {
         Group {
@@ -615,12 +622,8 @@ private struct DetailPane: View {
             // header: title + actions
             HStack(alignment: .center) {
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 9) {
-                        Text(v.displayName).font(.system(size: 26, weight: .bold))
-                            .foregroundStyle(UI.text)
-                        Image(systemName: "pencil").font(.system(size: 13))
-                            .foregroundStyle(UI.faint)
-                    }
+                    Text(v.displayName).font(.system(size: 26, weight: .bold))
+                        .foregroundStyle(UI.text)
                     Text(v.fileSystem.isEmpty ? "Unknown format" : v.fileSystem)
                         .font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.dim)
                 }
@@ -633,11 +636,10 @@ private struct DetailPane: View {
                             store.toggleMount(v)
                         }
                     }
-                    PillButton(icon: "checkmark.shield", label: "Verify") {
+                    PillButton(icon: "checkmark.shield",
+                               label: store.verifying ? "Verifying…" : "Verify",
+                               busy: store.verifying) {
                         store.verify(v)
-                    }
-                    PillButton(icon: "trash", label: "Erase") {
-                        store.actionMessage = "Erasing volumes isn't available in this build yet."
                     }
                 }
             }
@@ -667,24 +669,6 @@ private struct DetailPane: View {
             }
             .padding(.horizontal, 34).padding(.top, 30)
 
-            // mount options
-            Text("MOUNT OPTIONS").font(.system(size: 10.5, weight: .bold)).tracking(0.7)
-                .foregroundStyle(UI.faint)
-                .padding(.horizontal, 34).padding(.top, 34).padding(.bottom, 8)
-            VStack(spacing: 0) {
-                optionRow("clock.arrow.circlepath", "Save last access time", $saveAccess)
-                optionSep()
-                optionRow("magnifyingglass", "Enable Spotlight indexing", $spotlight)
-                optionSep()
-                optionRow("lock", "Mount as read-only", $readOnly)
-                optionSep()
-                optionRow("bolt.slash", "Skip automatic mounting", $noAuto)
-            }
-            .background(RoundedRectangle(cornerRadius: 12).fill(UI.card)
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(UI.line, lineWidth: 1)))
-            .frame(maxWidth: 460, alignment: .leading)
-            .padding(.horizontal, 34)
-
             Spacer(minLength: 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -711,21 +695,6 @@ private struct DetailPane: View {
         }
     }
 
-    private func optionRow(_ icon: String, _ label: String, _ bind: Binding<Bool>) -> some View {
-        HStack(spacing: 13) {
-            Image(systemName: icon).font(.system(size: 13))
-                .foregroundStyle(UI.dim).frame(width: 20)
-            Text(label).font(.system(size: 13.5)).foregroundStyle(UI.text)
-            Spacer(minLength: 16)
-            Toggle("", isOn: bind).labelsHidden().toggleStyle(.switch).tint(UI.accent)
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 14).padding(.vertical, 11)
-    }
-
-    private func optionSep() -> some View {
-        Rectangle().fill(UI.line).frame(height: 1).padding(.leading, 47)
-    }
 }
 
 // MARK: - Root
