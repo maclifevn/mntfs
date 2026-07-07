@@ -73,6 +73,7 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
                                   readOnly ? nil : devPwrite,
                                   devFlush, dev.sizeBytes, dev.sectorSize,
                                   readOnly, &name, &serial, &err) else {
+            NSLog("FastNTFS: fntfs_mount FAILED errno=\(err)")
             log.error("mount \(block.bsdName, privacy: .public) failed: errno \(err)")
             reply(nil, posixError(err == 0 ? EIO : err))
             return
@@ -84,7 +85,7 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
                                 name: label, serial: serial)
         activeVolume = volume
         activeDevice = dev
-        containerStatus = .active
+        containerStatus = .ready   // FSKit itself transitions .ready → .active
         reply(volume, nil)
     }
 

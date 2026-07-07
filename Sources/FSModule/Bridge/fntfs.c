@@ -404,7 +404,13 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
 
     fntfs_vol *v = calloc(1, sizeof(*v));
     if (!v) { *err_out = ENOMEM; return NULL; }
-    pthread_mutex_init(&v->lock, NULL);
+    /* Recursive: FSKit's directory enumeration calls back into fntfs_getattr
+       from inside the fntfs_readdir packer callback, on the same thread. */
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&v->lock, &mattr);
+    pthread_mutexattr_destroy(&mattr);
     v->devctx = (fntfs_dev_ctx){
         .swift_ctx = ctx,
         .pread_cb = pread_cb,
