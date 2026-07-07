@@ -147,6 +147,14 @@ struct VolumeItem: Identifiable, Hashable {
     var displayName: String { name.isEmpty ? "Untitled" : name }
     var sizeText: String { ByteCount.string(sizeBytes) }
     var usedFraction: Double { sizeBytes > 0 ? Double(usedBytes) / Double(sizeBytes) : 0 }
+    var readOnly: Bool { !writable }
+
+    /// diskutil misreports third-party FSKit NTFS volumes as "ExFAT"; trust the
+    /// partition content instead so NTFS drives read as NTFS.
+    var formatDisplay: String {
+        if isNTFS { return "Windows NTFS" }
+        return fileSystem.isEmpty ? "Unknown" : fileSystem
+    }
 }
 
 enum ByteCount {
@@ -416,7 +424,10 @@ private struct VolumeRow: View {
                     Text(v.displayName).font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(UI.text).lineLimit(1)
                     Spacer(minLength: 0)
-                    if !v.writable { Badge(text: "RO", kind: .rose) }
+                    if v.readOnly {
+                        Image(systemName: "lock.fill").font(.system(size: 10.5))
+                            .foregroundStyle(Color(0xff8f8f)).help("Read-only")
+                    }
                     if v.nobrowse { Badge(text: "hidden", kind: .amber) }
                 }
                 HStack(spacing: 6) {
@@ -579,8 +590,11 @@ private struct PillButton: View {
     }
 }
 
+enum AccessKind { case none, ro, rw }
+
 private struct InfoRow: View {
     let k: String; let v: String; var link = false; var good = false
+    var access: AccessKind = .none
     var body: some View {
         HStack(spacing: 10) {
             Text(k).font(.system(size: 12.5)).foregroundStyle(UI.dim)
@@ -590,6 +604,14 @@ private struct InfoRow: View {
                     Circle().fill(UI.green).frame(width: 7, height: 7)
                     Text(v)
                 }.font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.text)
+            } else if access != .none {
+                HStack(spacing: 6) {
+                    Image(systemName: access == .ro ? "lock.fill" : "square.and.pencil")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(v)
+                }
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(access == .ro ? Color(0xff8f8f) : Color(0x37d07f))
             } else {
                 Text(v).font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(link ? UI.accent : UI.text)
@@ -598,6 +620,24 @@ private struct InfoRow: View {
         }
         .padding(.vertical, 8)
         .overlay(alignment: .bottom) { Rectangle().fill(UI.line).frame(height: 1) }
+    }
+}
+
+/// Prominent read/write pill near the volume title. No cryptic "RO" text.
+private struct AccessBadge: View {
+    let readOnly: Bool
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: readOnly ? "lock.fill" : "square.and.pencil")
+                .font(.system(size: 10, weight: .bold))
+            Text(readOnly ? "Read-Only" : "Read & Write")
+                .font(.system(size: 11, weight: .bold))
+        }
+        .foregroundStyle(readOnly ? Color(0xffb0b0) : Color(0x62e6a4))
+        .padding(.horizontal, 9).padding(.vertical, 4)
+        .background(Capsule().fill((readOnly ? Color(0xff6f6f) : Color(0x37d07f)).opacity(0.16)))
+        .overlay(Capsule().stroke((readOnly ? Color(0xff6f6f) : Color(0x37d07f)).opacity(0.35),
+                                  lineWidth: 1))
     }
 }
 
@@ -621,11 +661,14 @@ private struct DetailPane: View {
         VStack(alignment: .leading, spacing: 0) {
             // header: title + actions
             HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 7) {
                     Text(v.displayName).font(.system(size: 26, weight: .bold))
                         .foregroundStyle(UI.text)
-                    Text(v.fileSystem.isEmpty ? "Unknown format" : v.fileSystem)
-                        .font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.dim)
+                    HStack(spacing: 9) {
+                        Text(v.formatDisplay)
+                            .font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.dim)
+                        AccessBadge(readOnly: v.readOnly)
+                    }
                 }
                 Spacer()
                 HStack(spacing: 9) {
@@ -661,7 +704,9 @@ private struct DetailPane: View {
                 VStack(alignment: .leading, spacing: 0) {
                     InfoRow(k: "Status", v: v.mounted ? "Mounted" : "Not mounted", good: v.mounted)
                     InfoRow(k: "Device", v: v.device)
-                    InfoRow(k: "Format", v: v.fileSystem.isEmpty ? "—" : v.fileSystem)
+                    InfoRow(k: "Format", v: v.formatDisplay)
+                    InfoRow(k: "Access", v: v.readOnly ? "Read-only" : "Read & Write",
+                            access: v.readOnly ? .ro : .rw)
                     InfoRow(k: "Location", v: v.mountPoint ?? "—", link: v.mounted)
                     capacityLegend(v).padding(.top, 16)
                 }
