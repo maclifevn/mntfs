@@ -569,7 +569,7 @@ private struct Sidebar: View {
                     .foregroundStyle(UI.dim)
                 Spacer()
             }
-            .padding(.horizontal, 16).padding(.vertical, 11)
+            .padding(.horizontal, 16).frame(height: 46)
         } else {
             Button { store.openExtensionSettings() } label: {
                 HStack(spacing: 9) {
@@ -586,7 +586,7 @@ private struct Sidebar: View {
                     Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
                         .foregroundStyle(UI.faint)
                 }
-                .padding(.horizontal, 14).padding(.vertical, 10)
+                .padding(.horizontal, 14).frame(height: 46)
                 .background(UI.amber.opacity(0.13))
                 .contentShape(Rectangle())
             }
@@ -719,26 +719,29 @@ private struct DetailPane: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 0) {
-            Text("Made with ❤️ for [Maclife](https://www.facebook.com/groups/maclife.vn) & [Đồng Bọn](https://www.facebook.com/groups/maclife.vn)")
-                .font(.system(size: 11.5))
-                .foregroundStyle(UI.faint)
-                .tint(UI.accent)
-            Spacer()
-            Button { showDonate.toggle() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "cup.and.saucer.fill").font(.system(size: 11))
-                    Text("Ủng hộ").font(.system(size: 12, weight: .medium))
+        VStack(spacing: 0) {
+            Rectangle().fill(UI.line).frame(height: 1)
+            HStack(spacing: 0) {
+                Text("Made with ❤️ for [Maclife & Đồng Bọn](https://www.facebook.com/groups/maclife.vn)")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(UI.faint)
+                    .tint(UI.accent)
+                Spacer()
+                Button { showDonate.toggle() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "cup.and.saucer.fill").font(.system(size: 11))
+                        Text("Ủng hộ").font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(Color(0x06222f))
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(UI.ntfsGrad))
                 }
-                .foregroundStyle(Color(0x06222f))
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(Capsule().fill(UI.ntfsGrad))
+                .buttonStyle(.plain)
+                .popover(isPresented: $showDonate, arrowEdge: .bottom) { DonateCard() }
             }
-            .buttonStyle(.plain)
-            .popover(isPresented: $showDonate, arrowEdge: .bottom) { DonateCard() }
+            .padding(.horizontal, 34)
+            .frame(height: 46)
         }
-        .padding(.horizontal, 34).padding(.vertical, 12)
-        .overlay(alignment: .top) { Rectangle().fill(UI.line).frame(height: 1) }
     }
 
     @ViewBuilder private func content(_ v: VolumeItem) -> some View {
