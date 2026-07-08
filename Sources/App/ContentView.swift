@@ -722,10 +722,14 @@ private struct DetailPane: View {
         VStack(spacing: 0) {
             Rectangle().fill(UI.line).frame(height: 1)
             HStack(spacing: 0) {
-                Text("Made with ❤️ for [Maclife & Đồng Bọn](https://www.facebook.com/groups/maclife.vn)")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(UI.faint)
-                    .tint(UI.accent)
+                HStack(spacing: 0) {
+                    Text("Made with ❤️ for ").foregroundStyle(UI.faint)
+                    Link("Maclife & Đồng Bọn",
+                         destination: URL(string: "https://www.facebook.com/groups/maclife.vn")!)
+                        .foregroundStyle(UI.accent)
+                        .pointerStyle(.link)
+                }
+                .font(.system(size: 11.5))
                 Spacer()
                 Button { showDonate.toggle() } label: {
                     HStack(spacing: 6) {
@@ -737,6 +741,7 @@ private struct DetailPane: View {
                     .background(Capsule().fill(UI.ntfsGrad))
                 }
                 .buttonStyle(.plain)
+                .pointerStyle(.link)
                 .popover(isPresented: $showDonate, arrowEdge: .bottom) { DonateCard() }
             }
             .padding(.horizontal, 34)
