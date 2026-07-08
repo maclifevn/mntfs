@@ -155,6 +155,7 @@
 				AA0000000000000000000803 /* Resources */,
 				AA0000000000000000000801 /* Sources */,
 				AA0000000000000000000501 /* Frameworks */,
+				AA0000000000000000000804 /* Sign mkntfs (hardened runtime) */,
 				AA0000000000000000000401 /* Embed ExtensionKit Extensions */,
 			);
 			buildRules = (
@@ -231,6 +232,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		AA0000000000000000000804 /* Sign mkntfs (hardened runtime) */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Sign mkntfs (hardened runtime)";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "TOOL=\"${CODESIGNING_FOLDER_PATH}/Contents/Resources/mkntfs\"\nif [ -f \"$TOOL\" ] && [ -n \"${EXPANDED_CODE_SIGN_IDENTITY}\" ]; then\n  codesign --force --options runtime --timestamp --sign \"${EXPANDED_CODE_SIGN_IDENTITY}\" \"$TOOL\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AA0000000000000000000801 /* Sources */ = {
