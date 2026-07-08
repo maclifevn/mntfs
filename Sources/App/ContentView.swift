@@ -149,8 +149,10 @@ struct VolumeItem: Identifiable, Hashable {
     var usedFraction: Double { sizeBytes > 0 ? Double(usedBytes) / Double(sizeBytes) : 0 }
     var readOnly: Bool { !writable }
 
-    /// diskutil misreports third-party FSKit NTFS volumes as "ExFAT"; trust the
-    /// partition content instead so NTFS drives read as NTFS.
+    /// `isNTFS` is derived from the real mounted filesystem type (see
+    /// `enumerate()`), so it stays correct even though diskutil labels our
+    /// FSKit NTFS volumes "ExFAT". Show NTFS for those, the true filesystem
+    /// name (e.g. "ExFAT", "APFS") for everything else.
     var formatDisplay: String {
         if isNTFS { return "Windows NTFS" }
         return fileSystem.isEmpty ? "Unknown" : fileSystem
@@ -192,6 +194,13 @@ final class VolumeStore: ObservableObject {
                 Task { @MainActor in self?.refresh() }
             }
         }
+        // Re-check the extension when the user returns from System Settings after
+        // toggling it on, so the status updates without a manual refresh.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.checkExtension() }
+        }
     }
 
     func refresh() {
@@ -212,6 +221,10 @@ final class VolumeStore: ObservableObject {
     }
 
     nonisolated private static func extensionEnabled() -> Bool {
+        // Definitive: if any volume is mounted by our driver, the extension is
+        // enabled and working right now — regardless of what pluginkit reports.
+        if hasMntfsMount() { return true }
+        // Idle (no NTFS volume mounted): fall back to pluginkit's enable flag.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
         p.arguments = ["-m", "-i", "com.fastntfs.FastNTFS.FSModule"]
@@ -258,6 +271,32 @@ final class VolumeStore: ObservableObject {
             as? [String: Any]
     }
 
+    /// Kernel filesystem type for a mount point (statfs f_fstypename): "mntfs",
+    /// "exfat", "ntfs", "apfs"… This is the ground truth. diskutil's
+    /// FilesystemType/Name both misreport our FSKit NTFS volumes as "exfat".
+    nonisolated private static func mountFSType(_ path: String) -> String {
+        var s = statfs()
+        guard statfs(path, &s) == 0 else { return "" }
+        return withUnsafeBytes(of: s.f_fstypename) {
+            String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+    }
+
+    /// True if any volume is currently mounted by our driver ("mntfs"): a
+    /// definitive sign the extension is enabled and working right now.
+    nonisolated static func hasMntfsMount() -> Bool {
+        var buf: UnsafeMutablePointer<statfs>?
+        let n = getmntinfo(&buf, MNT_NOWAIT)
+        guard n > 0, let buf else { return false }
+        for i in 0..<Int(n) {
+            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
+                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            if t == "mntfs" { return true }
+        }
+        return false
+    }
+
     nonisolated private static func enumerate() -> [VolumeItem] {
         guard let list = plist(run(["list", "-plist"])),
               let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
@@ -284,7 +323,20 @@ final class VolumeStore: ObservableObject {
             let writable = (info["WritableVolume"] as? NSNumber)?.boolValue ?? true
             let ejectable = (info["Ejectable"] as? NSNumber)?.boolValue ?? false
             let dev = (info["DeviceNode"] as? String) ?? "/dev/\(id)"
-            let isNTFS = fs.localizedCaseInsensitiveContains("ntfs") || content == "Windows_NTFS"
+            // Detect real NTFS from the KERNEL mount type (statfs f_fstypename),
+            // NOT diskutil's FilesystemType/Name — both misreport our FSKit NTFS
+            // volumes as "exfat" — and NOT the MBR partition byte (an exFAT drive
+            // reformatted over a former NTFS one keeps partition type 0x07). Our
+            // driver mounts as "mntfs", Apple's read-only handler as "ntfs".
+            let kfs = mount.map { Self.mountFSType($0) } ?? ""
+            let isNTFS: Bool
+            if kfs == "mntfs" || kfs == "ntfs" {
+                isNTFS = true
+            } else if !kfs.isEmpty {
+                isNTFS = false                     // mounted as exfat/apfs/hfs/msdos…
+            } else {                               // unmounted: best-effort guess
+                isNTFS = fs.localizedCaseInsensitiveContains("ntfs") || content == "Windows_NTFS"
+            }
             var used: Int64 = 0, free: Int64 = 0
             if let mp = mount,
                let a = try? FileManager.default.attributesOfFileSystem(forPath: mp) {
@@ -390,7 +442,21 @@ final class VolumeStore: ObservableObject {
         if outText.contains("-128") || outText.localizedCaseInsensitiveContains("cancel") {
             return "Erase cancelled."
         }
+        // macOS gates raw access to external drives behind Full Disk Access
+        // (TCC, attributed to this app) — even for root. Guide the user there.
+        if outText.localizedCaseInsensitiveContains("not permitted") {
+            return Self.fdaMessage
+        }
         return "Erase failed:\n\(outText)"
+    }
+
+    /// Marker + user guidance shown when Erase is blocked by missing
+    /// Full Disk Access. The alert adds an "Open Settings" button for it.
+    static let fdaMessage = "MNtfs needs Full Disk Access to reformat external drives.\n\nOpen System Settings → Privacy & Security → Full Disk Access, add MNtfs and turn it ON, then quit and reopen MNtfs and try again."
+
+    func openFullDiskAccessSettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+        NSWorkspace.shared.open(url)
     }
 
     nonisolated private static func sample() -> [VolumeItem] {
@@ -878,6 +944,12 @@ struct ContentView: View {
         .alert("MNtfs", isPresented: Binding(
             get: { store.actionMessage != nil },
             set: { if !$0 { store.actionMessage = nil } })) {
+            if store.actionMessage == VolumeStore.fdaMessage {
+                Button("Open Settings") {
+                    store.openFullDiskAccessSettings()
+                    store.actionMessage = nil
+                }
+            }
             Button("OK", role: .cancel) { store.actionMessage = nil }
         } message: {
             Text(store.actionMessage ?? "")
