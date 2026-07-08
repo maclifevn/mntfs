@@ -16,6 +16,7 @@
 		AA0000000000000000000215 /* BlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000115 /* BlockDevice.swift */; };
 		AA0000000000000000000216 /* fntfs.c in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000116 /* fntfs.c */; };
 		AA0000000000000000000217 /* mkntfs in Resources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000011B /* mkntfs */; };
+		AA0000000000000000000218 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000011C /* Assets.xcassets */; };
 		AA0000000000000000000221 /* FastNTFSFSModule.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000022 /* FastNTFSFSModule.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -60,6 +61,7 @@
 		AA0000000000000000000119 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA000000000000000000011A /* FSModule.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSModule.entitlements; sourceTree = "<group>"; };
 		AA000000000000000000011B /* mkntfs */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = Resources/mkntfs; sourceTree = "<group>"; };
+		AA000000000000000000011C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -104,6 +106,7 @@
 				AA0000000000000000000102 /* ContentView.swift */,
 				AA0000000000000000000103 /* FastNTFS.entitlements */,
 				AA000000000000000000011B /* mkntfs */,
+				AA000000000000000000011C /* Assets.xcassets */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -223,6 +226,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA0000000000000000000217 /* mkntfs in Resources */,
+				AA0000000000000000000218 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -314,6 +318,7 @@
 		AA0000000000000000000A11 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/FastNTFS.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -337,6 +342,7 @@
 		AA0000000000000000000A12 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/FastNTFS.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;

@@ -700,18 +700,45 @@ private struct AccessBadge: View {
 
 private struct DetailPane: View {
     @ObservedObject var store: VolumeStore
+    @State private var showDonate = false
 
     var body: some View {
-        Group {
-            if let v = store.selected {
-                content(v)
-            } else {
-                VStack { Spacer(); Text("Select a volume").foregroundStyle(UI.dim); Spacer() }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 0) {
+            Group {
+                if let v = store.selected {
+                    content(v)
+                } else {
+                    VStack { Spacer(); Text("Select a volume").foregroundStyle(UI.dim); Spacer() }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
+            footer
         }
         .background(LinearGradient(colors: [UI.detailA, UI.detailB],
                                    startPoint: .topLeading, endPoint: .bottomTrailing))
+    }
+
+    private var footer: some View {
+        HStack(spacing: 0) {
+            Text("Made with ❤️ for [Maclife](https://www.facebook.com/groups/maclife.vn) & [Đồng Bọn](https://www.facebook.com/groups/maclife.vn)")
+                .font(.system(size: 11.5))
+                .foregroundStyle(UI.faint)
+                .tint(UI.accent)
+            Spacer()
+            Button { showDonate.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "cup.and.saucer.fill").font(.system(size: 11))
+                    Text("Ủng hộ").font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(Color(0x06222f))
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Capsule().fill(UI.ntfsGrad))
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showDonate, arrowEdge: .bottom) { DonateCard() }
+        }
+        .padding(.horizontal, 34).padding(.vertical, 12)
+        .overlay(alignment: .top) { Rectangle().fill(UI.line).frame(height: 1) }
     }
 
     @ViewBuilder private func content(_ v: VolumeItem) -> some View {
@@ -804,6 +831,28 @@ private struct DetailPane: View {
         }
     }
 
+}
+
+// MARK: - Donate
+
+private struct DonateCard: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Mời mình ly cà phê ☕").font(.system(size: 15, weight: .bold))
+            Image("DonateQR").resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                .frame(width: 190, height: 190)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+            VStack(spacing: 6) {
+                Text("Nếu Mntfs hữu ích với bạn, một ly cà phê nhỏ giúp mình duy trì và phát triển dự án. Cảm ơn bạn! 🙏")
+                    .font(.callout).multilineTextAlignment(.center).foregroundStyle(.secondary)
+                Text("Quét bằng MoMo hoặc app ngân hàng (VietQR · Napas 247)")
+                    .font(.caption).multilineTextAlignment(.center).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(22).frame(width: 300)
+    }
 }
 
 // MARK: - Root
