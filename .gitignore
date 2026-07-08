@@ -11,3 +11,8 @@ vendor/ntfs-3g/configure.log
 
 # Bundled formatter — reproduced by scripts/build-vendor.sh
 Sources/App/Resources/mkntfs
+
+# Notarization secrets / artifacts
+*.p8
+dist/*.dmg
+MNtfs-app.zip
