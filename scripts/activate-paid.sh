@@ -17,21 +17,21 @@ xcodebuild -project FastNTFS.xcodeproj -target FastNTFS \
     -configuration Release -allowProvisioningUpdates \
     build
 
-APP="build/Release/Mntfs.app"
+APP="build/Release/MNtfs.app"
 echo "==> 3/4  Installing to /Applications"
-rm -rf /Applications/Mntfs.app
+rm -rf /Applications/MNtfs.app
 cp -R "$APP" /Applications/
-open /Applications/Mntfs.app
+open /Applications/MNtfs.app
 
 echo "==> 4/4  Registering the file-system extension"
-pluginkit -a /Applications/Mntfs.app/Contents/Extensions/FastNTFSFSModule.appex 2>/dev/null || true
+pluginkit -a /Applications/MNtfs.app/Contents/Extensions/FastNTFSFSModule.appex 2>/dev/null || true
 pluginkit -e use -i com.fastntfs.FastNTFS.FSModule 2>/dev/null || true
 
 cat <<'EOF'
 
 Done. Final manual step (macOS requires a human click here):
   System Settings → General → Login Items & Extensions
-    → File System Extensions → enable "Mntfs"
+    → File System Extensions → enable "MNtfs"
 
 Then test the mount pipeline end-to-end:
   dd if=/dev/zero of=/tmp/ntfs.img bs=1m count=256

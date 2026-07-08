@@ -515,7 +515,7 @@ private struct Sidebar: View {
             HStack(spacing: 10) {
                 DiskEmblem(size: 34)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("Mntfs").font(.system(size: 17, weight: .bold)).foregroundStyle(UI.text)
+                    Text("MNtfs").font(.system(size: 17, weight: .bold)).foregroundStyle(UI.text)
                     Text("NTFS for Mac").font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(UI.faint)
                 }
@@ -853,7 +853,7 @@ private struct DonateCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
             VStack(spacing: 6) {
-                Text("Nếu Mntfs hữu ích với bạn, một ly cà phê nhỏ giúp mình duy trì và phát triển dự án. Cảm ơn bạn! 🙏")
+                Text("Nếu MNtfs hữu ích với bạn, một ly cà phê nhỏ giúp mình duy trì và phát triển dự án. Cảm ơn bạn! 🙏")
                     .font(.callout).multilineTextAlignment(.center).foregroundStyle(.secondary)
                 Text("Quét bằng MoMo hoặc app ngân hàng (VietQR · Napas 247)")
                     .font(.caption).multilineTextAlignment(.center).foregroundStyle(.tertiary)
@@ -875,7 +875,7 @@ struct ContentView: View {
         .frame(minWidth: 1000, minHeight: 640)
         .background(UI.appBG)
         .preferredColorScheme(.dark)
-        .alert("Mntfs", isPresented: Binding(
+        .alert("MNtfs", isPresented: Binding(
             get: { store.actionMessage != nil },
             set: { if !$0 { store.actionMessage = nil } })) {
             Button("OK", role: .cancel) { store.actionMessage = nil }
