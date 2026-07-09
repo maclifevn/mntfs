@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MNtfs — Đọc & ghi ổ NTFS trên Mac</title>
+<meta name="description" content="Đọc và ghi ổ cứng NTFS trên macOS — không tắt bảo mật, không kernel extension. Xây trên FSKit của Apple.">
+<style>
+  :root{
+    --bg:#0a1420; --bg2:#0d1b2a; --card:#13212f; --card2:#172736;
+    --line:#22384c; --tx:#e9f0f6; --mut:#93a7ba; --mut2:#6f8498;
+    --blue:#2f9be0; --blue2:#57b6f2; --grn:#33d17a; --amber:#f5b845;
+    --rad:16px; --max:1080px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Inter,system-ui,sans-serif;
+    background:var(--bg); color:var(--tx); line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--max);margin:0 auto;padding:0 24px}
+  .btn{
+    display:inline-flex;align-items:center;gap:9px;font-weight:600;font-size:15px;
+    padding:13px 24px;border-radius:999px;cursor:pointer;border:0;transition:.18s;
+    background:linear-gradient(180deg,var(--blue2),var(--blue));color:#fff;
+    box-shadow:0 8px 26px -8px rgba(47,155,224,.7);
+  }
+  .btn:hover{transform:translateY(-2px);box-shadow:0 12px 32px -8px rgba(47,155,224,.85)}
+  .btn.ghost{background:transparent;border:1px solid var(--line);box-shadow:none;color:var(--tx)}
+  .btn.ghost:hover{border-color:var(--blue);background:rgba(47,155,224,.08)}
+  .sub{color:var(--mut)}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
+      background:rgba(10,20,32,.72);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:700;font-size:18px}
+  .brand img{width:34px;height:34px;border-radius:9px}
+  .brand small{display:block;font-size:11px;font-weight:500;color:var(--mut);letter-spacing:.3px}
+  nav a.link{font-size:14px;color:var(--mut);margin:0 14px;display:none}
+  nav a.link:hover{color:var(--tx)}
+  @media(min-width:820px){nav a.link{display:inline}}
+
+  /* hero */
+  .hero{position:relative;overflow:hidden;padding:78px 0 20px;text-align:center}
+  .hero::before{content:"";position:absolute;inset:-40% 0 auto;height:620px;
+    background:radial-gradient(60% 70% at 50% 0,rgba(47,155,224,.28),transparent 70%);
+    pointer-events:none}
+  .tag{display:inline-flex;gap:8px;align-items:center;font-size:13px;color:var(--blue2);
+    border:1px solid var(--line);padding:6px 14px;border-radius:999px;background:var(--card);margin-bottom:26px}
+  .tag b{color:var(--grn)}
+  h1{font-size:clamp(34px,6vw,58px);line-height:1.08;letter-spacing:-.02em;font-weight:800}
+  h1 .g{background:linear-gradient(120deg,var(--blue2),var(--grn));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:clamp(16px,2.4vw,20px);color:var(--mut);max-width:640px;margin:20px auto 30px}
+  .cta{display:flex;gap:13px;justify-content:center;flex-wrap:wrap}
+  .cta small{display:block;color:var(--mut2);font-size:13px;margin-top:14px;width:100%}
+
+  /* hero shot */
+  .shot{margin:52px auto 0;max-width:940px;border-radius:20px;overflow:hidden;
+    border:1px solid var(--line);box-shadow:0 40px 90px -40px rgba(0,0,0,.9);
+    background:var(--card)}
+  .shot img{display:block;width:100%;height:auto}
+
+  /* trust strip */
+  .trust{display:flex;flex-wrap:wrap;justify-content:center;gap:10px 26px;
+    padding:34px 24px 6px;color:var(--mut);font-size:14px}
+  .trust span{display:inline-flex;align-items:center;gap:8px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--grn);box-shadow:0 0 10px var(--grn)}
+
+  /* sections */
+  section{padding:64px 0}
+  .eyebrow{color:var(--blue2);font-weight:700;font-size:13px;letter-spacing:.14em;text-transform:uppercase;text-align:center}
+  h2{font-size:clamp(26px,4vw,38px);text-align:center;letter-spacing:-.02em;margin:10px 0 8px;font-weight:800}
+  .h2sub{text-align:center;color:var(--mut);max-width:600px;margin:0 auto 44px}
+
+  /* features */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+  .feat{background:var(--card);border:1px solid var(--line);border-radius:var(--rad);padding:24px}
+  .feat:hover{border-color:#33506b}
+  .fi{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:22px;margin-bottom:15px;
+    background:linear-gradient(180deg,rgba(47,155,224,.22),rgba(47,155,224,.06));border:1px solid var(--line)}
+  .feat h3{font-size:17px;margin-bottom:6px}
+  .feat p{color:var(--mut);font-size:14.5px}
+
+  /* how */
+  .how{background:var(--bg2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .arch{max-width:720px;margin:0 auto;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--rad);padding:22px 24px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:13.5px;color:var(--mut);line-height:1.9;overflow-x:auto;white-space:pre}
+  .arch b{color:var(--blue2)}
+
+  /* steps */
+  .step{display:grid;grid-template-columns:1fr;gap:22px;align-items:center;
+    padding:26px 0;border-top:1px solid var(--line)}
+  .step:first-of-type{border-top:0}
+  @media(min-width:760px){
+    .step{grid-template-columns:minmax(0,420px) 1fr;gap:40px}
+    .step.flip .txt{order:2}
+  }
+  .step .n{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:10px;
+    font-weight:700;background:linear-gradient(180deg,var(--blue2),var(--blue));color:#fff;margin-bottom:14px;font-size:15px}
+  .step h3{font-size:21px;letter-spacing:-.01em;margin-bottom:8px}
+  .step p{color:var(--mut);font-size:15px}
+  .step p kbd{font-family:inherit;background:var(--card2);border:1px solid var(--line);
+    border-radius:6px;padding:1px 7px;color:var(--tx);font-size:13.5px}
+  .frame{border-radius:14px;overflow:hidden;border:1px solid var(--line);background:var(--card);
+    box-shadow:0 26px 60px -34px rgba(0,0,0,.85);min-height:120px}
+  .frame img{display:block;width:100%;height:auto}
+  .frame .ph{display:grid;place-items:center;aspect-ratio:16/10;color:var(--mut2);font-size:13px;text-align:center;padding:20px;gap:6px}
+  .frame .ph b{color:var(--mut);font-weight:600}
+
+  /* download band */
+  .band{text-align:center;background:
+    radial-gradient(60% 120% at 50% 0,rgba(47,155,224,.16),transparent 70%)}
+  .band .box{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:48px 28px;max-width:720px;margin:0 auto}
+  .req{display:flex;gap:8px 22px;justify-content:center;flex-wrap:wrap;color:var(--mut);font-size:14px;margin-top:18px}
+
+  footer{border-top:1px solid var(--line);padding:38px 0;color:var(--mut2);font-size:14px;text-align:center}
+  footer a{color:var(--blue2)}
+  footer .lic{margin-top:8px;font-size:12.5px;color:var(--mut2)}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="#top"><img src="assets/icon.png" alt="MNtfs">
+    <span>MNtfs<small>NTFS for Mac</small></span></a>
+  <div>
+    <a class="link" href="#features">Tính năng</a>
+    <a class="link" href="#install">Cài đặt</a>
+    <a class="link" href="#download">Tải về</a>
+    <a class="btn" href="#download" style="padding:9px 18px;font-size:14px">Tải về</a>
+  </div>
+</div></nav>
+
+<header class="hero" id="top"><div class="wrap">
+  <span class="tag">Xây trên <b>FSKit</b> của Apple · macOS 15.4+ · Apple Silicon</span>
+  <h1>Đọc &amp; ghi ổ <span class="g">NTFS</span><br>trên Mac của bạn</h1>
+  <p class="lede">Cắm ổ cứng Windows vào là ghi được ngay — <b>không tắt SIP, không kernel
+    extension, không giảm bảo mật</b>. Chạy nền ở menu bar và tự mount mỗi khi khởi động.</p>
+  <div class="cta">
+    <a class="btn" href="#download">⤓ Tải MNtfs cho macOS</a>
+    <a class="btn ghost" href="#install">Xem cách cài</a>
+    <small>Miễn phí · Đã ký &amp; notarize bởi Apple · Không cần tài khoản Developer</small>
+  </div>
+  <div class="shot">
+    <img src="assets/step-4.png" alt="Giao diện MNtfs" loading="lazy"
+      onerror="this.parentNode.innerHTML='&lt;div class=&quot;ph&quot; style=&quot;aspect-ratio:16/10;display:grid;place-items:center;color:#6f8498&quot;&gt;&lt;b&gt;assets/step-4.png&lt;/b&gt;&lt;br&gt;(ảnh giao diện chính)&lt;/div&gt;'">
+  </div>
+</div></header>
+
+<div class="trust wrap">
+  <span><i class="dot"></i> Full Security (SIP + Gatekeeper bật)</span>
+  <span><i class="dot"></i> Không kernel extension</span>
+  <span><i class="dot"></i> Engine libntfs-3g dày dạn</span>
+  <span><i class="dot"></i> Không FUSE</span>
+</div>
+
+<section id="features"><div class="wrap">
+  <div class="eyebrow">Tính năng</div>
+  <h2>Mọi thứ để dùng NTFS như trên Windows</h2>
+  <p class="h2sub">Trình điều khiển NTFS-ghi <b>đầu tiên xây trên FSKit</b> — hạ tầng chính thức
+    mà Apple dùng cho exFAT và MS-DOS.</p>
+  <div class="grid">
+    <div class="feat"><div class="fi">✍️</div><h3>Đọc &amp; ghi thật</h3>
+      <p>Toàn quyền chép, sửa, xoá, đổi tên trên ổ NTFS — qua đường FSKit chính thức của macOS.</p></div>
+    <div class="feat"><div class="fi">🪟</div><h3>Hỗ trợ Fast Startup</h3>
+      <p>Ổ Windows tắt nhanh / ngủ đông vẫn ghi được, thay vì bị từ chối như ntfs-3g thường gặp.</p></div>
+    <div class="feat"><div class="fi">⚡</div><h3>Tự mount khi khởi động</h3>
+      <p>Chạy nền ở thanh menu, cắm ổ là tự mount Read &amp; Write — không cần mở app hay rút/cắm lại.</p></div>
+    <div class="feat"><div class="fi">🏷️</div><h3>Hiển thị đúng tên</h3>
+      <p>Finder và Disk Utility nhận đúng “Windows NT File System (NTFS)”, không còn dán nhầm “ExFAT”.</p></div>
+    <div class="feat"><div class="fi">🧹</div><h3>Format lại (Erase)</h3>
+      <p>Định dạng lại ổ NTFS ngay trong app, có xác nhận an toàn để tránh nhầm ổ.</p></div>
+    <div class="feat"><div class="fi">🔒</div><h3>An toàn tuyệt đối</h3>
+      <p>Không tắt SIP, không hạ Gatekeeper, không nạp kernel. Gỡ ra là máy sạch như chưa cài.</p></div>
+  </div>
+</div></section>
+
+<section class="how"><div class="wrap">
+  <div class="eyebrow">Kiến trúc</div>
+  <h2>Chạy trên hạ tầng của chính Apple</h2>
+  <p class="h2sub">Kết hợp engine NTFS <b>libntfs-3g</b> đã kiểm chứng nhiều năm với
+    <b>FSKit</b> userspace của macOS 15.4+. Không FUSE, không hack kernel.</p>
+  <div class="arch">Finder / mọi ứng dụng
+   │  (VFS)
+FSKit của kernel
+   │  (XPC)
+<b>FastNTFSFSModule</b>   — Swift: FSKit file-system extension
+   │
+<b>fntfs.c</b> → <b>libntfs-3g</b>   — engine NTFS thật, không FUSE
+   │
+FSBlockDeviceResource   — đọc/ghi block trực tiếp qua fskitd</div>
+</div></section>
+
+<section id="install"><div class="wrap">
+  <div class="eyebrow">Cài đặt</div>
+  <h2>5 bước, một lần duy nhất</h2>
+  <p class="h2sub">Sau khi cài xong, cứ cắm ổ NTFS là dùng được — không phải làm lại gì.</p>
+
+  <div class="step">
+    <div class="txt"><span class="n">1</span>
+      <h3>Kéo vào Applications</h3>
+      <p>Mở file <kbd>MNtfs.dmg</kbd>, kéo biểu tượng <b>MNtfs</b> vào thư mục
+        <b>Applications</b>, rồi mở ứng dụng lần đầu.</p></div>
+    <div class="frame"><div class="ph"><b>Kéo MNtfs → Applications</b>
+      <span>(bước kéo-thả quen thuộc của macOS)</span></div></div>
+  </div>
+
+  <div class="step flip">
+    <div class="txt"><span class="n">2</span>
+      <h3>Cài hỗ trợ hiển thị tên</h3>
+      <p>Ở hộp thoại hiện lên, bấm <kbd>Install</kbd> để Finder và Disk Utility hiển thị
+        đúng “Windows NTFS”. Nhập mật khẩu quản trị <b>một lần</b>.</p></div>
+    <div class="frame"><img src="assets/step-1.png" loading="lazy" alt="Bấm Install"
+      onerror="this.parentNode.innerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;b&gt;assets/step-1.png&lt;/b&gt;&lt;span&gt;Hộp thoại “Show NTFS drives correctly?” → Install&lt;/span&gt;&lt;/div&gt;'"></div>
+  </div>
+
+  <div class="step">
+    <div class="txt"><span class="n">3</span>
+      <h3>Mở phần bật extension</h3>
+      <p>Bấm vào dải <kbd>Extension not enabled</kbd> ở góc dưới bên trái cửa sổ app
+        để mở đúng trang cài đặt của hệ thống.</p></div>
+    <div class="frame"><img src="assets/step-2.png" loading="lazy" alt="Extension not enabled"
+      onerror="this.parentNode.innerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;b&gt;assets/step-2.png&lt;/b&gt;&lt;span&gt;Bấm dải “Extension not enabled” ở góc dưới&lt;/span&gt;&lt;/div&gt;'"></div>
+  </div>
+
+  <div class="step flip">
+    <div class="txt"><span class="n">4</span>
+      <h3>Gạt bật FastNTFSFSModule</h3>
+      <p>Trong <b>File System Extensions</b>, <b>bật công tắc</b>
+        <kbd>FastNTFSFSModule</kbd> rồi bấm <kbd>Done</kbd>. Đây là cổng bảo mật của
+        Apple — chỉ bạn mới bật được.</p></div>
+    <div class="frame"><img src="assets/step-3.png" loading="lazy" alt="Bật FastNTFSFSModule"
+      onerror="this.parentNode.innerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;b&gt;assets/step-3.png&lt;/b&gt;&lt;span&gt;System Settings → File System Extensions → bật FastNTFSFSModule&lt;/span&gt;&lt;/div&gt;'"></div>
+  </div>
+
+  <div class="step">
+    <div class="txt"><span class="n">5</span>
+      <h3>Xong — cắm ổ là ghi được</h3>
+      <p>Cắm ổ NTFS vào, nó <b>tự mount Read &amp; Write</b> và app hiện
+        <b style="color:var(--grn)">● Extension active</b>. Từ giờ mọi ổ NTFS đều dùng được ngay,
+        kể cả sau khi khởi động lại máy.</p></div>
+    <div class="frame"><img src="assets/step-4.png" loading="lazy" alt="Ổ NTFS Read & Write"
+      onerror="this.parentNode.innerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;b&gt;assets/step-4.png&lt;/b&gt;&lt;span&gt;Ổ hiện “Windows NTFS · Read &amp; Write”&lt;/span&gt;&lt;/div&gt;'"></div>
+  </div>
+
+  <p class="sub" style="text-align:center;margin-top:30px;font-size:14px">
+    Muốn dùng <b>Erase</b> (định dạng lại)? Cấp thêm quyền cho MNtfs ở
+    <b>Privacy &amp; Security → Full Disk Access</b> — macOS yêu cầu quyền này để truy cập ổ ở mức thấp.</p>
+</div></section>
+
+<section class="band" id="download"><div class="wrap">
+  <div class="box">
+    <div class="eyebrow">Tải về</div>
+    <h2 style="margin-top:8px">Sẵn sàng ghi NTFS?</h2>
+    <p class="sub" style="max-width:520px;margin:6px auto 24px">
+      Bản đã ký Developer ID và notarize bởi Apple — chạy trên mọi máy Mac Apple Silicon,
+      không cần tắt bảo mật.</p>
+    <a class="btn" href="MNtfs-0.1.0.dmg" style="font-size:16px;padding:15px 30px">⤓ Tải MNtfs 0.1.0 (.dmg)</a>
+    <div class="req">
+      <span>macOS 15.4 trở lên</span> · <span>Mac Apple Silicon (M1+)</span> · <span>~3,5 MB</span>
+    </div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  Made with ❤️ for <a href="https://www.facebook.com/groups/maclife.vn" target="_blank" rel="noopener">Maclife &amp; Đồng Bọn</a>
+  <div class="lic">MNtfs liên kết tĩnh <a href="https://github.com/tuxera/ntfs-3g" target="_blank" rel="noopener">libntfs-3g</a>
+    (GPL-2.0), nên được phát hành theo <b>GPL-2.0</b>.</div>
+</div></footer>
+
+</body>
+</html>
