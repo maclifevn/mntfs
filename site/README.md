@@ -1,22 +1,21 @@
 # MNtfs — Landing page
 
-Trang giới thiệu tĩnh (một file `index.html` tự chứa, chỉ CSS nội tuyến).
+Trang giới thiệu tĩnh, tông tối theo giao diện app. Hai phiên bản:
 
-## Thêm ảnh của bạn
-
-Lưu 4 screenshot các bước cài vào thư mục `assets/` với đúng tên sau:
-
-| File | Nội dung ảnh |
+| File | Dùng khi |
 |---|---|
-| `assets/step-1.png` | Hộp thoại **"Show NTFS drives correctly?"** → nút **Install** |
-| `assets/step-2.png` | Cửa sổ chính, dải **"Extension not enabled"** ở góc dưới |
-| `assets/step-3.png` | System Settings → File System Extensions → bật **FastNTFSFSModule** |
-| `assets/step-4.png` | Ổ NTFS **"Untitled — Windows NTFS · Read & Write"** (cũng dùng làm ảnh hero) |
+| **`standalone.html`** | 1 file **tự chứa** — mọi ảnh đã nhúng base64. Gửi/host ở đâu cũng chạy, không cần thư mục `assets/`. |
+| **`index.html`** + `assets/` | Bản gốc để chỉnh sửa; ảnh nằm rời trong `assets/` (đã tối ưu, ~656 KB). |
 
-`assets/icon.png` (logo) đã có sẵn. Nếu thiếu file nào, trang tự hiện khung placeholder thay cho ảnh — không vỡ layout.
+Ảnh screenshot các bước cài đặt: `assets/install.jpg`, `assets/step-1.jpg` … `assets/step-4.jpg`.
 
 ## Xem thử / phát hành
 
-- Xem tại chỗ: mở `index.html` bằng trình duyệt.
-- Phát hành: đưa cả thư mục `site/` lên GitHub Pages, Netlify, Vercel, hoặc server bất kỳ.
-- Nút tải: `index.html` trỏ tới `MNtfs-0.1.0.dmg` — đặt file DMG cạnh `index.html` hoặc sửa link cho trỏ tới GitHub Release.
+- Xem tại chỗ: mở `standalone.html` (hoặc `index.html`) bằng trình duyệt.
+- Phát hành: đưa `standalone.html` (đổi tên thành `index.html`) lên GitHub Pages / Netlify / Vercel / server bất kỳ.
+- Nút tải trỏ `MNtfs-0.1.0.dmg` — đặt file DMG cạnh trang, hoặc sửa link trỏ tới GitHub Release.
+
+## Dựng lại `standalone.html` sau khi đổi ảnh
+
+Tối ưu ảnh trong `assets/` rồi thay chuỗi `src="assets/…"` trong `index.html`
+bằng data-URI base64 tương ứng.
