@@ -432,7 +432,11 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
     if (readonly)
         flags |= NTFS_MNT_RDONLY;
     else
-        flags |= NTFS_MNT_RECOVER; /* replay the journal if dirty */
+        /* RECOVER replays a dirty $LogFile. IGNORE_HIBERFILE mounts read-write
+           even when Windows left a hiberfil.sys behind — which is the norm with
+           Fast Startup / hybrid shutdown (Windows 10/11 default) and otherwise
+           makes ntfs-3g refuse the mount entirely ("failed to mount"). */
+        flags |= NTFS_MNT_RECOVER | NTFS_MNT_IGNORE_HIBERFILE;
 
     v->vol = ntfs_device_mount(v->dev, flags);
     if (!v->vol) {

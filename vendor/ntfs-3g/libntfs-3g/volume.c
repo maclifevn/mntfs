@@ -1292,15 +1292,21 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, ntfs_mount_flags flags)
 				goto error_exit;
 			}
 		if (ntfs_volume_check_logfile(vol) < 0) {
-			/* Always reject cached metadata for now */
-			if (!(flags & NTFS_MNT_RECOVER) || (errno == EPERM)) {
+			/* MNtfs: with RECOVER, reset the $LogFile even when it holds
+			   Windows "fast restart" cached metadata (errno == EPERM).
+			   Upstream ntfs-3g refuses that case; resetting it discards the
+			   stale Windows Fast Startup / hibernation cache — safe, Windows
+			   just does a full boot next time — so the volume mounts
+			   read-write instead of failing with "unsafe state". */
+			if (!(flags & NTFS_MNT_RECOVER)) {
 				if (flags & NTFS_MNT_MAY_RDONLY)
 					need_fallback_ro = TRUE;
 				else
 					goto error_exit;
 			} else {
 				ntfs_log_info("The file system wasn't safely "
-					      "closed on Windows. Fixing.\n");
+					      "closed on Windows (or Fast Startup is "
+					      "on). Resetting the journal.\n");
 				if (ntfs_logfile_reset(vol))
 					goto error_exit;
 			}

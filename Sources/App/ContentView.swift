@@ -233,17 +233,21 @@ final class VolumeStore: ObservableObject {
 
     func checkExtension() {
         Task.detached(priority: .utility) {
-            let active = Self.extensionEnabled()
-            await MainActor.run { self.extensionActive = active }
+            // Definitive "working": a volume mounted writable by our driver.
+            let working = Self.hasMntfsMount()
+            // Show "not enabled" only when there's an NTFS volume that Apple's
+            // read-only handler grabbed (our driver didn't claim it → the
+            // toggle is off). With no such drive there's nothing to warn about,
+            // so treat as active. pluginkit's "+" flag is unreliable (stays set
+            // after the toggle is turned off), so we don't consult it.
+            let active = working || Self.readOnlyAppleNTFSDevices().isEmpty
+            await MainActor.run {
+                self.extensionActive = active
+                // Only a real writable mount proves setup is complete — stop
+                // auto-showing the setup window at login once we've seen one.
+                if working { UserDefaults.standard.set(true, forKey: "setupComplete") }
+            }
         }
-    }
-
-    /// Whether our extension is enabled and working right now. The ONLY reliable
-    /// signal is a volume it has actually mounted writable ("mntfs"): pluginkit's
-    /// "+" flag stays set even after the System Settings toggle is turned off, so
-    /// trusting it made the status show "active" while the extension was disabled.
-    nonisolated private static func extensionEnabled() -> Bool {
-        hasMntfsMount()
     }
 
     func openExtensionSettings() {
