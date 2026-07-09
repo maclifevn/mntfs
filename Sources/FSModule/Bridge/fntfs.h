@@ -24,13 +24,15 @@ extern "C" {
 
 typedef struct fntfs_vol fntfs_vol;
 
-/* I/O callbacks. Return bytes transferred, or -errno. */
-typedef int64_t (*fntfs_pread_cb)(void *_Nonnull ctx, void *_Nonnull buf,
+/* I/O callbacks. `ctx` is an opaque handle passed straight back to the caller
+   (never dereferenced by the bridge), so it may be NULL. Return bytes
+   transferred, or -errno. */
+typedef int64_t (*fntfs_pread_cb)(void *_Nullable ctx, void *_Nonnull buf,
                                   int64_t count, int64_t offset);
-typedef int64_t (*fntfs_pwrite_cb)(void *_Nonnull ctx, const void *_Nonnull buf,
+typedef int64_t (*fntfs_pwrite_cb)(void *_Nullable ctx, const void *_Nonnull buf,
                                    int64_t count, int64_t offset);
 /* Flush device caches. Return 0 or -errno. */
-typedef int (*fntfs_flush_cb)(void *_Nonnull ctx);
+typedef int (*fntfs_flush_cb)(void *_Nullable ctx);
 
 enum {
     FNTFS_TYPE_UNKNOWN = 0,
@@ -80,7 +82,7 @@ enum {
  * Probe a device. Attempts a read-only mount to fetch the volume label and
  * serial; falls back to a boot-sector check. name_out must hold >= 256 bytes.
  */
-int fntfs_probe(void *_Nonnull ctx, fntfs_pread_cb _Nonnull pread_cb,
+int fntfs_probe(void *_Nullable ctx, fntfs_pread_cb _Nonnull pread_cb,
                 uint64_t dev_size, uint32_t sector_size,
                 char *_Nonnull name_out, uint64_t *_Nonnull serial_out);
 
@@ -88,7 +90,7 @@ int fntfs_probe(void *_Nonnull ctx, fntfs_pread_cb _Nonnull pread_cb,
  * Mount. On success returns a volume handle and fills name/serial.
  * On failure returns NULL and sets *err_out to a positive errno.
  */
-fntfs_vol *_Nullable fntfs_mount(void *_Nonnull ctx,
+fntfs_vol *_Nullable fntfs_mount(void *_Nullable ctx,
                                  fntfs_pread_cb _Nonnull pread_cb,
                                  fntfs_pwrite_cb _Nullable pwrite_cb,
                                  fntfs_flush_cb _Nullable flush_cb,
@@ -149,12 +151,17 @@ int fntfs_link(fntfs_vol *_Nonnull v, uint64_t inum, uint64_t dir,
                const char *_Nonnull name);
 
 /*
- * Rename/move. Destination must not exist (FSKit removes `overItem` first via
- * fntfs_remove). Works for files and directories.
+ * Rename/move `inum` from src_dir/src_name to dst_dir/dst_name. Works for files
+ * and directories. If `over_inum` is non-zero the destination name already
+ * exists and holds that inode; it is replaced atomically-safely (the old target
+ * is kept under a temporary name until the move fully succeeds, so a mid-way
+ * failure never loses the destination file). Pass over_inum == 0 when the
+ * destination does not exist.
  */
 int fntfs_rename(fntfs_vol *_Nonnull v, uint64_t inum,
                  uint64_t src_dir, const char *_Nonnull src_name,
-                 uint64_t dst_dir, const char *_Nonnull dst_name);
+                 uint64_t dst_dir, const char *_Nonnull dst_name,
+                 uint64_t over_inum);
 
 int fntfs_truncate(fntfs_vol *_Nonnull v, uint64_t inum, uint64_t size);
 

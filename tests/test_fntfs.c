@@ -212,23 +212,41 @@ int main(int argc, char **argv)
     printf("cookie resumption ok\n");
 
     /* --- rename (same dir, cross dir) --- */
-    CHECK(fntfs_rename(v, fa.inum, root, "hello.txt", root, "chao.txt") == 0,
+    CHECK(fntfs_rename(v, fa.inum, root, "hello.txt", root, "chao.txt", 0) == 0,
           "rename same dir");
     CHECK(fntfs_lookup(v, root, "chao.txt", &la) == 0 && la.inum == fa.inum,
           "renamed lookup");
     CHECK(fntfs_lookup(v, root, "hello.txt", &la) == -ENOENT, "old gone");
-    CHECK(fntfs_rename(v, fa.inum, root, "chao.txt", da.inum, "moved.txt") == 0,
+    CHECK(fntfs_rename(v, fa.inum, root, "chao.txt", da.inum, "moved.txt", 0) == 0,
           "rename cross dir");
     CHECK(fntfs_lookup(v, da.inum, "moved.txt", &la) == 0, "moved lookup");
     r = fntfs_read(v, fa.inum, rbuf, sizeof(rbuf), 0);
     CHECK(r == (int64_t)strlen(msg) && !memcmp(rbuf, msg, strlen(msg)),
           "content survives rename");
 
-    /* --- rename directory --- */
-    CHECK(fntfs_rename(v, da.inum, root, "Thu Muc", root, "ThuMuc2") == 0,
+    /* --- rename directory (and its nested content survives) --- */
+    CHECK(fntfs_rename(v, da.inum, root, "Thu Muc", root, "ThuMuc2", 0) == 0,
           "rename dir");
     CHECK(fntfs_lookup(v, root, "ThuMuc2", &la) == 0 && la.inum == da.inum,
           "renamed dir lookup");
+    CHECK(fntfs_lookup(v, da.inum, "nested-tệp.dat", &la) == 0,
+          "nested file survives dir rename");
+
+    /* --- overwrite rename: destination is replaced with source data, and the
+           old destination's data is gone (this is the P0 data-loss path) --- */
+    fntfs_attrs ka, wa;
+    CHECK(fntfs_create(v, root, "keep.txt", false, &ka) == 0, "create keep");
+    CHECK(fntfs_create(v, root, "victim.txt", false, &wa) == 0, "create victim");
+    CHECK(fntfs_write(v, ka.inum, "SRC", 3, 0) == 3, "write keep");
+    CHECK(fntfs_write(v, wa.inum, "DEST-DATA", 9, 0) == 9, "write victim");
+    CHECK(fntfs_rename(v, ka.inum, root, "keep.txt",
+                       root, "victim.txt", wa.inum) == 0, "overwrite rename");
+    CHECK(fntfs_lookup(v, root, "keep.txt", &la) == -ENOENT, "source name gone");
+    CHECK(fntfs_lookup(v, root, "victim.txt", &la) == 0 && la.inum == ka.inum,
+          "dest name now maps to the source inode");
+    r = fntfs_read(v, ka.inum, rbuf, sizeof(rbuf), 0);
+    CHECK(r == 3 && !memcmp(rbuf, "SRC", 3), "overwrite kept source data");
+    printf("overwrite rename ok\n");
 
     /* --- hard link --- */
     CHECK(fntfs_link(v, fa.inum, root, "hardlink.txt") == 0, "hardlink");

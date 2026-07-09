@@ -47,59 +47,81 @@ typedef struct {
     bool            readonly;
 } fntfs_dev_ctx;
 
+/* Cap on any single bounce allocation used for unaligned I/O. A multiple of
+   both common sector sizes (512, 4096); large unaligned requests are processed
+   in chunks of this size instead of one giant malloc. */
+enum { BOUNCE_CHUNK = 1 << 20 };   /* 1 MiB */
+
 static int64_t dev_pread_aligned(fntfs_dev_ctx *c, void *buf, int64_t count,
                                  int64_t offset)
 {
-    if (offset < 0) return -EINVAL;
+    if (offset < 0 || count < 0) return -EINVAL;
     if (offset >= c->size) return 0;
-    if (offset + count > c->size) count = c->size - offset;
-    if (count <= 0) return 0;
+    if (count > c->size - offset) count = c->size - offset;   /* overflow-safe */
+    if (count == 0) return 0;
 
     const uint32_t ss = c->sector;
     if ((offset % ss) == 0 && (count % ss) == 0)
         return c->pread_cb(c->swift_ctx, buf, count, offset);
 
-    int64_t astart = (offset / ss) * ss;
-    int64_t aend = ((offset + count + ss - 1) / ss) * ss;
-    if (aend > c->size) aend = c->size;
-    int64_t alen = aend - astart;
-    char *tmp = malloc((size_t)alen);
+    /* Unaligned: bounce through a size-capped aligned buffer, chunk by chunk. */
+    char *tmp = malloc(BOUNCE_CHUNK);
     if (!tmp) return -ENOMEM;
-    int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
-    if (r < 0) { free(tmp); return r; }
-    int64_t avail = r - (offset - astart);
-    if (avail < 0) avail = 0;
-    if (avail > count) avail = count;
-    memcpy(buf, tmp + (offset - astart), (size_t)avail);
+    int64_t done = 0;
+    while (done < count) {
+        int64_t o = offset + done;
+        int64_t astart = (o / ss) * ss;                 /* align down */
+        int64_t alen = BOUNCE_CHUNK;                     /* ss divides 1 MiB */
+        if (astart + alen > c->size) alen = c->size - astart;
+        int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
+        if (r < 0) { free(tmp); return done ? done : r; }
+        int64_t skip = o - astart;                       /* 0 .. ss-1 */
+        int64_t avail = r - skip;
+        if (avail <= 0) break;                            /* short read / EOF */
+        int64_t chunk = count - done;
+        if (chunk > avail) chunk = avail;
+        memcpy((char *)buf + done, tmp + skip, (size_t)chunk);
+        done += chunk;
+        if (r < alen) break;                              /* EOF inside span */
+    }
     free(tmp);
-    return avail;
+    return done;
 }
 
 static int64_t dev_pwrite_aligned(fntfs_dev_ctx *c, const void *buf,
                                   int64_t count, int64_t offset)
 {
     if (c->readonly || !c->pwrite_cb) return -EROFS;
-    if (offset < 0 || offset + count > c->size) return -EIO;
-    if (count <= 0) return 0;
+    if (offset < 0 || count < 0) return -EINVAL;
+    if (offset >= c->size || count > c->size - offset) return -EIO;  /* overflow-safe */
+    if (count == 0) return 0;
 
     const uint32_t ss = c->sector;
     if ((offset % ss) == 0 && (count % ss) == 0)
         return c->pwrite_cb(c->swift_ctx, buf, count, offset);
 
-    /* Read-modify-write the covering aligned span. */
-    int64_t astart = (offset / ss) * ss;
-    int64_t aend = ((offset + count + ss - 1) / ss) * ss;
-    if (aend > c->size) aend = c->size;
-    int64_t alen = aend - astart;
-    char *tmp = malloc((size_t)alen);
+    /* Unaligned: read-modify-write a size-capped aligned span, chunk by chunk,
+       so a big unaligned request never forces one huge allocation. */
+    char *tmp = malloc(BOUNCE_CHUNK);
     if (!tmp) return -ENOMEM;
-    int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
-    if (r < alen) { free(tmp); return r < 0 ? r : -EIO; }
-    memcpy(tmp + (offset - astart), buf, (size_t)count);
-    int64_t w = c->pwrite_cb(c->swift_ctx, tmp, alen, astart);
+    int64_t done = 0;
+    while (done < count) {
+        int64_t o = offset + done;
+        int64_t astart = (o / ss) * ss;
+        int64_t alen = BOUNCE_CHUNK;
+        if (astart + alen > c->size) alen = c->size - astart;
+        int64_t skip = o - astart;
+        int64_t chunk = count - done;
+        if (chunk > alen - skip) chunk = alen - skip;
+        int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
+        if (r < alen) { free(tmp); return done ? done : (r < 0 ? r : -EIO); }
+        memcpy(tmp + skip, (const char *)buf + done, (size_t)chunk);
+        int64_t w = c->pwrite_cb(c->swift_ctx, tmp, alen, astart);
+        if (w < alen) { free(tmp); return done ? done : (w < 0 ? w : -EIO); }
+        done += chunk;
+    }
     free(tmp);
-    if (w < alen) return w < 0 ? w : -EIO;
-    return count;
+    return done;
 }
 
 /* errno-style adapters for ntfs_device_operations */
@@ -773,16 +795,69 @@ int fntfs_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
 }
 
 int fntfs_rename(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
-                 const char *src_name, uint64_t dst_dir, const char *dst_name)
+                 const char *src_name, uint64_t dst_dir, const char *dst_name,
+                 uint64_t over_inum)
 {
-    int err = fntfs_link(v, inum, dst_dir, dst_name);
-    if (err)
+    /* The recursive lock is held across the whole sequence so the individual
+       link/remove steps (each of which also locks) can't interleave with other
+       operations — the rename is atomic with respect to the rest of the driver.
+       NTFS keeps a file's parent in its $FILE_NAME attribute, so link-to-new +
+       remove-old correctly re-parents files AND directories (ntfs_link permits
+       directory links, which is exactly how ntfs-3g's own rename moves dirs). */
+    LOCK(v);
+    int err;
+
+    if (!over_inum) {
+        /* Destination is free: add the new name, then drop the old one. */
+        err = fntfs_link(v, inum, dst_dir, dst_name);
+        if (!err) {
+            err = fntfs_remove(v, src_dir, src_name, inum);
+            if (err)
+                fntfs_remove(v, dst_dir, dst_name, inum);   /* roll back */
+        }
+        UNLOCK(v);
         return err;
-    err = fntfs_remove(v, src_dir, src_name, inum);
-    if (err) {
-        /* Roll the new link back so we don't leave two names behind. */
-        fntfs_remove(v, dst_dir, dst_name, inum);
     }
+
+    /* Overwrite: never delete the destination up front. Park the existing
+       target under a temporary "ghost" name so any failure can restore it
+       (mirrors ntfs-3g's ntfs_fuse_safe_rename). */
+    static unsigned long seq;
+    char ghost[64];
+    snprintf(ghost, sizeof ghost, ".ntfs-mv-%08lx-%llx",
+             ++seq, (unsigned long long)over_inum);
+
+    err = fntfs_link(v, over_inum, dst_dir, ghost);         /* 1: park target */
+    if (err) { UNLOCK(v); return err; }
+
+    err = fntfs_remove(v, dst_dir, dst_name, over_inum);    /* 2: free the name */
+    if (err) {
+        fntfs_remove(v, dst_dir, ghost, over_inum);         /* undo 1 */
+        UNLOCK(v);
+        return err;
+    }
+
+    err = fntfs_link(v, inum, dst_dir, dst_name);           /* 3: move source in */
+    if (err)
+        goto restore;
+
+    err = fntfs_remove(v, src_dir, src_name, inum);         /* 4: drop old name */
+    if (err) {
+        fntfs_remove(v, dst_dir, dst_name, inum);           /* undo 3 */
+        goto restore;
+    }
+
+    /* Success: the old target dies with its last (ghost) name. */
+    fntfs_remove(v, dst_dir, ghost, over_inum);
+    UNLOCK(v);
+    return 0;
+
+restore:
+    /* Put the destination back under its real name; if that also fails the
+       target survives under the ghost name (data preserved, never lost). */
+    if (!fntfs_link(v, over_inum, dst_dir, dst_name))
+        fntfs_remove(v, dst_dir, ghost, over_inum);
+    UNLOCK(v);
     return err;
 }
 

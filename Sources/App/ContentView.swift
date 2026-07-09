@@ -345,8 +345,15 @@ final class VolumeStore: ObservableObject {
             }
             devs.append(dev)
         }
-        for dev in devs where run(["unmount", dev]) != nil {
-            _ = run(["mount", dev])
+        for dev in devs {
+            // Plain (non-force) unmount: it fails if the volume is busy, so an
+            // in-progress copy is never interrupted — we just skip it.
+            let r = run(["unmount", dev])
+            if r.ok {
+                _ = run(["mount", dev])
+            } else {
+                NSLog("MNtfs: skip remount of busy %@ (%@)", dev, r.text)
+            }
         }
     }
 
@@ -383,21 +390,32 @@ final class VolumeStore: ObservableObject {
         scanning = false
     }
 
-    @discardableResult
-    nonisolated private static func run(_ args: [String]) -> Data? {
+    /// Result of a diskutil invocation. Keeps the exit status so callers can tell
+    /// a real failure from merely-unexpected output (grepping stdout is fragile).
+    struct RunResult {
+        let status: Int32
+        let out: Data
+        var ok: Bool { status == 0 }
+        var text: String {
+            (String(data: out, encoding: .utf8) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    nonisolated private static func run(_ args: [String]) -> RunResult {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
         p.arguments = args
         let out = Pipe(); p.standardOutput = out; p.standardError = out
-        do { try p.run() } catch { return nil }
+        do { try p.run() } catch { return RunResult(status: -1, out: Data()) }
         let d = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        return d.isEmpty ? nil : d
+        return RunResult(status: p.terminationStatus, out: d)
     }
 
-    nonisolated private static func plist(_ d: Data?) -> [String: Any]? {
-        guard let d else { return nil }
-        return (try? PropertyListSerialization.propertyList(from: d, options: [], format: nil))
+    nonisolated private static func plist(_ r: RunResult) -> [String: Any]? {
+        guard r.ok, !r.out.isEmpty else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: r.out, options: [], format: nil))
             as? [String: Any]
     }
 
@@ -460,10 +478,17 @@ final class VolumeStore: ObservableObject {
             }
             guard !todo.isEmpty else { return }
             for dev in todo {
+                NSLog("MNtfs: auto-remount read-only NTFS %@", dev)
                 // Right after login/enable the extension may still be warming up,
                 // so the first remount can come back read-only — retry a few times.
                 for _ in 0..<3 {
-                    _ = Self.run(["unmount", dev])
+                    // Plain unmount: fails (and we stop) if the volume is busy,
+                    // so we never yank a drive out from under an in-progress read.
+                    let r = Self.run(["unmount", dev])
+                    guard r.ok else {
+                        NSLog("MNtfs: leave busy %@ as-is (%@)", dev, r.text)
+                        break
+                    }
                     _ = Self.run(["mount", dev])
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     if !Self.readOnlyAppleNTFSDevices().contains(dev) { break }
@@ -566,13 +591,12 @@ final class VolumeStore: ObservableObject {
     func toggleMount(_ v: VolumeItem) {
         let mounting = !v.mounted
         Task.detached(priority: .userInitiated) {
-            let out = Self.run([mounting ? "mount" : "unmount", v.device])
-            let text = out.flatMap { String(data: $0, encoding: .utf8) }?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let r = Self.run([mounting ? "mount" : "unmount", v.device])
             await MainActor.run {
-                if !text.isEmpty, text.localizedCaseInsensitiveContains("failed")
-                    || text.localizedCaseInsensitiveContains("could not") {
-                    self.actionMessage = text
+                if !r.ok {   // trust the exit code, not a substring match
+                    self.actionMessage = r.text.isEmpty
+                        ? "diskutil \(mounting ? "mount" : "unmount") failed (status \(r.status))."
+                        : r.text
                 }
                 self.refresh()
             }
@@ -582,11 +606,10 @@ final class VolumeStore: ObservableObject {
     func verify(_ v: VolumeItem) {
         verifying = true
         Task.detached(priority: .userInitiated) {
-            let out = Self.run(["verifyVolume", v.device])
-            let text = out.flatMap { String(data: $0, encoding: .utf8) } ?? "No output."
+            let r = Self.run(["verifyVolume", v.device])
             await MainActor.run {
                 self.verifying = false
-                self.actionMessage = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.actionMessage = r.text.isEmpty ? "No output." : r.text
             }
         }
     }
@@ -614,8 +637,9 @@ final class VolumeStore: ObservableObject {
         guard let mkntfs = Bundle.main.path(forResource: "mkntfs", ofType: nil) else {
             return "Erase failed: the mkntfs formatter is missing from the app bundle."
         }
-        // Best-effort unmount so mkntfs can take the raw partition.
-        _ = run(["unmount", device])
+        // The user has confirmed destruction, so force the volume unmounted to
+        // be sure mkntfs can take the raw partition.
+        _ = run(["unmount", "force", device])
 
         // Sanitize the label; mkntfs -Q quick-formats, -F forces past warnings.
         let label = String(name.prefix(32)).filter { $0 != "\"" && $0 != "'" && $0 != "\\" }
@@ -1043,9 +1067,10 @@ private struct DetailPane: View {
                                busy: store.verifying) {
                         store.verify(v)
                     }
-                    // Reformatting as NTFS only makes sense for a removable NTFS
-                    // volume — never the boot disk.
-                    if v.isNTFS && v.mountPoint != "/" {
+                    // Erase is destructive, so only offer it for a REMOVABLE
+                    // (ejectable) NTFS volume — never the boot disk and never an
+                    // internal partition (e.g. a Boot Camp / Windows system disk).
+                    if v.isNTFS && v.ejectable && v.mountPoint != "/" {
                         PillButton(icon: "trash", label: "Erase") {
                             store.eraseTarget = v
                         }
@@ -1175,35 +1200,57 @@ struct ContentView: View {
     }
 }
 
-/// Destructive reformat dialog. Requires an explicit volume-name confirmation.
+/// Destructive reformat dialog. Shows exactly which disk is targeted and
+/// requires the user to retype the current volume name to confirm.
 private struct EraseSheet: View {
     let volume: VolumeItem
     let erasing: Bool
     let onErase: (String) -> Void
     let onCancel: () -> Void
     @State private var name: String = ""
+    @State private var confirm: String = ""
+
+    private var confirmed: Bool {
+        confirm.trimmingCharacters(in: .whitespaces) == volume.displayName
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 14) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 30)).foregroundStyle(Color(0xf5a623))
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Erase “\(volume.displayName)”?")
                         .font(.system(size: 16, weight: .bold))
-                    Text("This permanently deletes everything on \(volume.device) and "
+                    Text("This permanently deletes everything on this drive and "
                          + "reformats it as NTFS. This cannot be undone.")
                         .font(.system(size: 12.5)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
+            // Spell out exactly which disk, so nobody erases the wrong one.
+            VStack(alignment: .leading, spacing: 3) {
+                eraseInfoRow("Volume", volume.displayName)
+                eraseInfoRow("Device", volume.device)
+                eraseInfoRow("Size", volume.sizeText)
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.05)))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("TYPE “\(volume.displayName)” TO CONFIRM")
+                    .font(.system(size: 10, weight: .bold)).tracking(0.6)
+                    .foregroundStyle(.secondary)
+                TextField(volume.displayName, text: $confirm)
+                    .textFieldStyle(.roundedBorder).disabled(erasing)
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("NEW VOLUME NAME").font(.system(size: 10, weight: .bold)).tracking(0.6)
                     .foregroundStyle(.secondary)
                 TextField("Untitled", text: $name)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(erasing)
+                    .textFieldStyle(.roundedBorder).disabled(erasing)
                 Text("Format: Windows NTFS").font(.system(size: 11)).foregroundStyle(.secondary)
             }
 
@@ -1219,12 +1266,21 @@ private struct EraseSheet: View {
                     Text("Erase").frame(minWidth: 60)
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(erasing || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(erasing || !confirmed
+                          || name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(22)
         .frame(width: 440)
         .onAppear { name = volume.displayName }
+    }
+
+    private func eraseInfoRow(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
+            Text(v).font(.system(size: 11.5, weight: .medium))
+            Spacer()
+        }
     }
 }
 

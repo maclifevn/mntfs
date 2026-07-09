@@ -57,8 +57,8 @@ xcodebuild -project FastNTFS.xcodeproj -target FastNTFS \
 
 Then:
 
-1. Copy `build/Release/FastNTFS.app` to `/Applications` and launch it once.
-2. Enable **FastNTFS** under *System Settings → General → Login Items &
+1. Copy `build/Release/MNtfs.app` to `/Applications` and launch it once.
+2. Enable **FastNTFSFSModule** under *System Settings → General → Login Items &
    Extensions → File System Extensions*.
 3. Plug in an NTFS disk — or mount manually:
 

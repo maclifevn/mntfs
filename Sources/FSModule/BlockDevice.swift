@@ -35,6 +35,7 @@ func posixCode(_ error: Error) -> Int32 {
 
 /// C thunks — no captured context; the device is recovered from `ctx`.
 let devPread: fntfs_pread_cb = { ctx, buf, count, offset in
+    guard let ctx else { return -Int64(EINVAL) }
     let dev = Unmanaged<BlockDevice>.fromOpaque(ctx).takeUnretainedValue()
     do {
         let buffer = UnsafeMutableRawBufferPointer(start: buf, count: Int(count))
@@ -47,6 +48,7 @@ let devPread: fntfs_pread_cb = { ctx, buf, count, offset in
 }
 
 let devPwrite: fntfs_pwrite_cb = { ctx, buf, count, offset in
+    guard let ctx else { return -Int64(EINVAL) }
     let dev = Unmanaged<BlockDevice>.fromOpaque(ctx).takeUnretainedValue()
     do {
         let buffer = UnsafeRawBufferPointer(start: buf, count: Int(count))

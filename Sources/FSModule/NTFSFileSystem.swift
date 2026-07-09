@@ -19,8 +19,17 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
     private var activeVolume: NTFSVolume?
     private var activeDevice: BlockDevice?
-    /// Most recently seen block resource; the check task operates on it.
-    fileprivate var lastResource: FSBlockDeviceResource?
+
+    /// The block resource this module instance is working with. FSKit runs a
+    /// separate extension process per resource, so within a process this
+    /// identifies the one device being probed/loaded/checked. Guarded by a lock
+    /// because probe and the check task can run on different threads.
+    private let resourceLock = NSLock()
+    private var _lastResource: FSBlockDeviceResource?
+    fileprivate var lastResource: FSBlockDeviceResource? {
+        get { resourceLock.lock(); defer { resourceLock.unlock() }; return _lastResource }
+        set { resourceLock.lock(); defer { resourceLock.unlock() }; _lastResource = newValue }
+    }
 
     func probeResource(resource: FSResource,
                        replyHandler reply: @escaping (FSProbeResult?, Error?) -> Void) {

@@ -129,6 +129,14 @@ final class NTFSVolume: FSVolume {
         return v
     }
 
+    /// Volume pointer for a mutating operation. Rejects writes early with EROFS
+    /// on a read-only mount instead of letting them travel down to the bridge.
+    private func requireWritableVolume() throws -> OpaquePointer {
+        let v = try requireVolume()
+        if readOnly { throw posixError(EROFS) }
+        return v
+    }
+
     private func requireItem(_ item: FSItem) throws -> NTFSItem {
         guard let it = item as? NTFSItem else { throw posixError(EINVAL) }
         return it
@@ -254,63 +262,10 @@ extension NTFSVolume: FSVolume.Operations {
                        on item: FSItem,
                        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let it = try requireItem(item)
 
-            if newAttributes.isValid(.size), it.type == .file {
-                let err = fntfs_truncate(v, it.inum, newAttributes.size)
-                guard err == 0 else { reply(nil, posixError(-err)); return }
-                newAttributes.consumedAttributes.insert(.size)
-            }
-
-            var times = fntfs_attrs()
-            var mask: UInt32 = 0
-            if newAttributes.isValid(.modifyTime) {
-                times.mtime_sec = Int64(newAttributes.modifyTime.tv_sec)
-                times.mtime_nsec = Int32(newAttributes.modifyTime.tv_nsec)
-                mask |= UInt32(FNTFS_SET_MTIME)
-            }
-            if newAttributes.isValid(.accessTime) {
-                times.atime_sec = Int64(newAttributes.accessTime.tv_sec)
-                times.atime_nsec = Int32(newAttributes.accessTime.tv_nsec)
-                mask |= UInt32(FNTFS_SET_ATIME)
-            }
-            if newAttributes.isValid(.birthTime) {
-                times.crtime_sec = Int64(newAttributes.birthTime.tv_sec)
-                times.crtime_nsec = Int32(newAttributes.birthTime.tv_nsec)
-                mask |= UInt32(FNTFS_SET_CRTIME)
-            }
-            if mask != 0 {
-                let err = fntfs_settimes(v, it.inum, &times, mask)
-                guard err == 0 else { reply(nil, posixError(-err)); return }
-                if mask & UInt32(FNTFS_SET_MTIME) != 0 {
-                    newAttributes.consumedAttributes.insert(.modifyTime)
-                }
-                if mask & UInt32(FNTFS_SET_ATIME) != 0 {
-                    newAttributes.consumedAttributes.insert(.accessTime)
-                }
-                if mask & UInt32(FNTFS_SET_CRTIME) != 0 {
-                    newAttributes.consumedAttributes.insert(.birthTime)
-                }
-            }
-
-            if newAttributes.isValid(.flags) {
-                var a = fntfs_attrs()
-                var err = fntfs_getattr(v, it.inum, &a)
-                if err == 0 {
-                    var wa = a.win_attrs
-                    if newAttributes.flags & UInt32(UF_HIDDEN) != 0 {
-                        wa |= UInt32(FNTFS_WINATTR_HIDDEN)
-                    } else {
-                        wa &= ~UInt32(FNTFS_WINATTR_HIDDEN)
-                    }
-                    if wa != a.win_attrs {
-                        err = fntfs_setwinattrs(v, it.inum, wa)
-                    }
-                }
-                guard err == 0 else { reply(nil, posixError(-err)); return }
-                newAttributes.consumedAttributes.insert(.flags)
-            }
+            try applyAttributes(v, it.inum, isFile: it.type == .file, newAttributes)
 
             var a = fntfs_attrs()
             let err = fntfs_getattr(v, it.inum, &a)
@@ -318,6 +273,60 @@ extension NTFSVolume: FSVolume.Operations {
             reply(fsAttributes(a), nil)
         } catch {
             reply(nil, error)
+        }
+    }
+
+    /// Apply the settable attributes (size, times, hidden flag) to `inum`,
+    /// marking each as consumed. Throws a POSIX error on failure. Shared by
+    /// setAttributes and createItem (so a create honours its initial attrs).
+    private func applyAttributes(_ v: OpaquePointer, _ inum: UInt64,
+                                 isFile: Bool,
+                                 _ req: FSItem.SetAttributesRequest) throws {
+        if req.isValid(.size), isFile {
+            let err = fntfs_truncate(v, inum, req.size)
+            guard err == 0 else { throw posixError(-err) }
+            req.consumedAttributes.insert(.size)
+        }
+
+        var times = fntfs_attrs()
+        var mask: UInt32 = 0
+        if req.isValid(.modifyTime) {
+            times.mtime_sec = Int64(req.modifyTime.tv_sec)
+            times.mtime_nsec = Int32(req.modifyTime.tv_nsec)
+            mask |= UInt32(FNTFS_SET_MTIME)
+        }
+        if req.isValid(.accessTime) {
+            times.atime_sec = Int64(req.accessTime.tv_sec)
+            times.atime_nsec = Int32(req.accessTime.tv_nsec)
+            mask |= UInt32(FNTFS_SET_ATIME)
+        }
+        if req.isValid(.birthTime) {
+            times.crtime_sec = Int64(req.birthTime.tv_sec)
+            times.crtime_nsec = Int32(req.birthTime.tv_nsec)
+            mask |= UInt32(FNTFS_SET_CRTIME)
+        }
+        if mask != 0 {
+            let err = fntfs_settimes(v, inum, &times, mask)
+            guard err == 0 else { throw posixError(-err) }
+            if mask & UInt32(FNTFS_SET_MTIME) != 0 { req.consumedAttributes.insert(.modifyTime) }
+            if mask & UInt32(FNTFS_SET_ATIME) != 0 { req.consumedAttributes.insert(.accessTime) }
+            if mask & UInt32(FNTFS_SET_CRTIME) != 0 { req.consumedAttributes.insert(.birthTime) }
+        }
+
+        if req.isValid(.flags) {
+            var a = fntfs_attrs()
+            var err = fntfs_getattr(v, inum, &a)
+            if err == 0 {
+                var wa = a.win_attrs
+                if req.flags & UInt32(UF_HIDDEN) != 0 {
+                    wa |= UInt32(FNTFS_WINATTR_HIDDEN)
+                } else {
+                    wa &= ~UInt32(FNTFS_WINATTR_HIDDEN)
+                }
+                if wa != a.win_attrs { err = fntfs_setwinattrs(v, inum, wa) }
+            }
+            guard err == 0 else { throw posixError(-err) }
+            req.consumedAttributes.insert(.flags)
         }
     }
 
@@ -355,7 +364,7 @@ extension NTFSVolume: FSVolume.Operations {
                     attributes newAttributes: FSItem.SetAttributesRequest,
                     replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let dir = try requireItem(directory)
             let nm = try utf8Name(name)
             guard type == .file || type == .directory else {
@@ -364,6 +373,10 @@ extension NTFSVolume: FSVolume.Operations {
             var a = fntfs_attrs()
             let err = fntfs_create(v, dir.inum, nm, type == .directory, &a)
             guard err == 0 else { reply(nil, nil, posixError(-err)); return }
+            // Honour the requested initial attributes (times/size/flags).
+            // Best-effort: the item exists regardless, so don't fail the create
+            // if only the attribute pass hits a problem.
+            try? applyAttributes(v, a.inum, isFile: type == .file, newAttributes)
             _ = bumpGeneration()
             let it = item(inum: a.inum, type: Self.itemType(a.type))
             reply(it, name, nil)
@@ -383,7 +396,7 @@ extension NTFSVolume: FSVolume.Operations {
                     inDirectory directory: FSItem,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let it = try requireItem(item)
             let dir = try requireItem(directory)
             let nm = try utf8Name(name)
@@ -400,7 +413,7 @@ extension NTFSVolume: FSVolume.Operations {
                     fromDirectory directory: FSItem,
                     replyHandler reply: @escaping (Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let it = try requireItem(item)
             let dir = try requireItem(directory)
             let nm = try utf8Name(name)
@@ -418,21 +431,19 @@ extension NTFSVolume: FSVolume.Operations {
                     inDirectory destinationDirectory: FSItem, overItem: FSItem?,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let it = try requireItem(item)
             let srcDir = try requireItem(sourceDirectory)
             let dstDir = try requireItem(destinationDirectory)
             let srcName = try utf8Name(sourceName)
             let dstName = try utf8Name(destinationName)
 
-            if let over = overItem {
-                let overIt = try requireItem(over)
-                let err = fntfs_remove(v, dstDir.inum, dstName, overIt.inum)
-                guard err == 0 else { reply(nil, posixError(-err)); return }
-            }
-
+            // Do NOT delete the destination up front — the bridge replaces it
+            // atomically-safely (keeping the old target under a temporary name
+            // until the move succeeds) so a failed rename can't lose data.
+            let overInum = try overItem.map { try requireItem($0).inum } ?? 0
             let err = fntfs_rename(v, it.inum, srcDir.inum, srcName,
-                                   dstDir.inum, dstName)
+                                   dstDir.inum, dstName, overInum)
             guard err == 0 else { reply(nil, posixError(-err)); return }
             _ = bumpGeneration()
             reply(destinationName, nil)
@@ -539,7 +550,7 @@ extension NTFSVolume: FSVolume.ReadWriteOperations {
     func write(contents: Data, to item: FSItem, at offset: off_t,
                replyHandler reply: @escaping (Int, Error?) -> Void) {
         do {
-            let v = try requireVolume()
+            let v = try requireWritableVolume()
             let it = try requireItem(item)
             let n: Int64 = contents.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return 0 }
