@@ -18,3 +18,7 @@ dist/*.dmg
 MNtfs-app.zip
 dist/MNtfs.app/
 signing/*.bak-*
+
+# Landing page (host riêng, không để trong repo code)
+site/
+.claude/launch.json
