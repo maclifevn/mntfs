@@ -182,9 +182,11 @@ final class VolumeStore: ObservableObject {
     @Published var eraseTarget: VolumeItem?
     @Published var offerLabelSupport = false
 
-    /// Devices we already tried to convert from Apple's read-only mount, so a
-    /// cold extension can't send us into an unmount/remount loop.
-    private var remountAttempted: Set<String> = []
+    /// Last time we tried to convert each device from Apple's read-only mount
+    /// (throttle, so a cold/disabled extension can't send us into a tight loop),
+    /// and devices currently being processed (guard against overlapping runs).
+    private var remountAttempts: [String: Date] = [:]
+    private var remountInFlight: Set<String> = []
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
@@ -201,18 +203,22 @@ final class VolumeStore: ObservableObject {
         nc.addObserver(forName: .init("NSWorkspaceDidUnmountNotification"),
                        object: nil, queue: .main) { [weak self] _ in
             // A drive left: let a future replug of the same device be retried.
-            Task { @MainActor in self?.remountAttempted.removeAll(); self?.refresh() }
+            Task { @MainActor in self?.remountAttempts.removeAll(); self?.refresh() }
         }
         nc.addObserver(forName: .init("NSWorkspaceDidRenameVolumeNotification"),
                        object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        // Re-check the extension when the user returns from System Settings after
-        // toggling it on, so the status updates without a manual refresh.
+        // Returning from System Settings after toggling the extension on: re-check
+        // status AND force a remount of any read-only drive, so an already-plugged
+        // drive becomes writable and the status flips to active without a replug.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.checkExtension() }
+            Task { @MainActor in
+                self?.checkExtension()
+                self?.autoRemountReadOnlyNTFS(force: true)
+            }
         }
     }
 
@@ -437,21 +443,31 @@ final class VolumeStore: ObservableObject {
     /// it once so DiskArbitration re-probes and our writable "mntfs" driver
     /// (probe order 500, ahead of Apple's 1000) claims it. This is what makes
     /// drives writable right after login without a manual replug.
-    func autoRemountReadOnlyNTFS() {
+    /// - Parameter force: bypass the per-device throttle (used when the user
+    ///   returns from System Settings, where a prompt retry is expected).
+    /// We deliberately do NOT gate on `extensionEnabled()`: that check is
+    /// unreliable right after the toggle flips, so instead we just attempt the
+    /// remount — if the extension isn't ready the volume stays read-only and a
+    /// later trigger retries; if it is, our writable driver takes over.
+    func autoRemountReadOnlyNTFS(force: Bool = false) {
         Task.detached(priority: .utility) {
-            // Pointless (and loop-prone) unless our extension is actually enabled.
-            guard Self.extensionEnabled() else { return }
             let devs = Self.readOnlyAppleNTFSDevices()
             guard !devs.isEmpty else { return }
+            let now = Date()
             let todo: [String] = await MainActor.run {
-                let fresh = devs.filter { !self.remountAttempted.contains($0) }
-                fresh.forEach { self.remountAttempted.insert($0) }
-                return fresh
+                devs.filter { dev in
+                    if self.remountInFlight.contains(dev) { return false }
+                    if !force, let last = self.remountAttempts[dev],
+                       now.timeIntervalSince(last) < 8 { return false }
+                    self.remountAttempts[dev] = now
+                    self.remountInFlight.insert(dev)
+                    return true
+                }
             }
             guard !todo.isEmpty else { return }
             for dev in todo {
-                // Right after login the extension may still be warming up, so the
-                // first remount can come back read-only again — retry a few times.
+                // Right after login/enable the extension may still be warming up,
+                // so the first remount can come back read-only — retry a few times.
                 for _ in 0..<3 {
                     _ = Self.run(["unmount", dev])
                     _ = Self.run(["mount", dev])
@@ -459,7 +475,10 @@ final class VolumeStore: ObservableObject {
                     if !Self.readOnlyAppleNTFSDevices().contains(dev) { break }
                 }
             }
-            await MainActor.run { self.refresh() }
+            await MainActor.run {
+                todo.forEach { self.remountInFlight.remove($0) }
+                self.refresh()
+            }
         }
     }
 
