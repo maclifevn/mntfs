@@ -231,7 +231,6 @@ final class VolumeStore: ObservableObject {
         }
     }
 
-    /// Ask pluginkit whether our FSKit module is enabled ("+" prefix = enabled).
     func checkExtension() {
         Task.detached(priority: .utility) {
             let active = Self.extensionEnabled()
@@ -239,21 +238,12 @@ final class VolumeStore: ObservableObject {
         }
     }
 
+    /// Whether our extension is enabled and working right now. The ONLY reliable
+    /// signal is a volume it has actually mounted writable ("mntfs"): pluginkit's
+    /// "+" flag stays set even after the System Settings toggle is turned off, so
+    /// trusting it made the status show "active" while the extension was disabled.
     nonisolated private static func extensionEnabled() -> Bool {
-        // Definitive: if any volume is mounted by our driver, the extension is
-        // enabled and working right now — regardless of what pluginkit reports.
-        if hasMntfsMount() { return true }
-        // Idle (no NTFS volume mounted): fall back to pluginkit's enable flag.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
-        p.arguments = ["-m", "-i", "com.fastntfs.FastNTFS.FSModule"]
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-        do { try p.run() } catch { return false }
-        let d = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard let s = String(data: d, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return false }
-        return s.hasPrefix("+")
+        hasMntfsMount()
     }
 
     func openExtensionSettings() {
