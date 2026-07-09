@@ -11,9 +11,13 @@ set -e
 cd "$(dirname "$0")/.."
 
 DEVID="${MNTFS_DEVID:-Developer ID Application: Anh Tuan Vu Nguyen (CF5PGH3KGK)}"
-KEY="${ASC_KEY:-/Users/maclife/Downloads/AuthKey_REDACTED.p8}"
-KID="${ASC_KEY_ID:-REDACTED}"
-ISS="${ASC_ISSUER:-REDACTED}"
+# App Store Connect API credentials — supply via the environment, never commit:
+#   ASC_KEY      path to your AuthKey_XXXXXX.p8
+#   ASC_KEY_ID   the key's ID
+#   ASC_ISSUER   your team's Issuer ID
+KEY="${ASC_KEY:?set ASC_KEY to the path of your App Store Connect .p8 key}"
+KID="${ASC_KEY_ID:?set ASC_KEY_ID to your App Store Connect Key ID}"
+ISS="${ASC_ISSUER:?set ASC_ISSUER to your App Store Connect Issuer ID}"
 VERSION="${1:-0.1.0}"
 
 APP="build/Release/MNtfs.app"
