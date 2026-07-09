@@ -61,18 +61,23 @@
 		</dict>
 		<key>FSPersonalities</key>
 		<dict>
-			<key>Mntfs</key>
+			<key>NTFS</key>
 			<dict>
 				<key>FSName</key>
-				<string>Mntfs</string>
-				<key>FSfileObjectsAreCaseSensitive</key>
-				<false/>
+				<string>Windows NT File System (NTFS)</string>
 			</dict>
 		</dict>
 		<key>FSRequiresSecurityScopedPathURLResources</key>
 		<false/>
+		<!-- Must be unique: the name "ntfs" is reserved by Apple's own
+		     read-only NTFS support (a system plugin bridged through FSKit),
+		     and PlugInKit rejects any third-party module that claims it
+		     ("a system plugin has precedent"). So we use "mntfs"; the
+		     user-visible name comes from FSPersonalities > FSName above. -->
 		<key>FSShortName</key>
 		<string>mntfs</string>
+		<key>FSVolumeAlwaysIgnoreOwnership</key>
+		<true/>
 		<key>FSSupportsBlockResources</key>
 		<true/>
 		<key>FSSupportsGenericURLResources</key>

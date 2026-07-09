@@ -181,6 +181,8 @@ extension NTFSVolume: FSVolume.Operations {
     }
 
     var volumeStatistics: FSStatFSResult {
+        // Must equal the Info.plist FSShortName ("mntfs"). "ntfs" is reserved
+        // by Apple's system NTFS plugin and gets our module rejected.
         let res = FSStatFSResult(fileSystemTypeName: "mntfs")
         guard let v = vol else { return res }
         var sf = fntfs_statfs_t()

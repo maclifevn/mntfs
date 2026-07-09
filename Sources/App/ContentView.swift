@@ -180,19 +180,32 @@ final class VolumeStore: ObservableObject {
     @Published var verifying = false
     @Published var erasing = false
     @Published var eraseTarget: VolumeItem?
+    @Published var offerLabelSupport = false
+
+    /// Devices we already tried to convert from Apple's read-only mount, so a
+    /// cold extension can't send us into an unmount/remount loop.
+    private var remountAttempted: Set<String> = []
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
     init() {
         refresh()
         checkExtension()
+        maybeOfferLabelSupport()
+        autoRemountReadOnlyNTFS()   // fix drives Apple mounted read-only at boot
         let nc = NSWorkspace.shared.notificationCenter
-        for name: NSNotification.Name in [.init("NSWorkspaceDidMountNotification"),
-                                          .init("NSWorkspaceDidUnmountNotification"),
-                                          .init("NSWorkspaceDidRenameVolumeNotification")] {
-            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.refresh() }
-            }
+        nc.addObserver(forName: .init("NSWorkspaceDidMountNotification"),
+                       object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refresh(); self?.autoRemountReadOnlyNTFS() }
+        }
+        nc.addObserver(forName: .init("NSWorkspaceDidUnmountNotification"),
+                       object: nil, queue: .main) { [weak self] _ in
+            // A drive left: let a future replug of the same device be retried.
+            Task { @MainActor in self?.remountAttempted.removeAll(); self?.refresh() }
+        }
+        nc.addObserver(forName: .init("NSWorkspaceDidRenameVolumeNotification"),
+                       object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
         }
         // Re-check the extension when the user returns from System Settings after
         // toggling it on, so the status updates without a manual refresh.
@@ -242,6 +255,123 @@ final class VolumeStore: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    // MARK: NTFS name registration for Finder / Disk Utility
+    //
+    // FSKit gives no runtime channel for a third-party volume's display type, and
+    // the "ntfs" short name is reserved by Apple's system handler. But Finder and
+    // Disk Utility resolve a mount's f_fstypename ("mntfs") to a display name via
+    // the classic filesystem-bundle registry. Dropping a tiny name-only bundle
+    // (no FSMediaTypes, so it never competes for probing/mounting) at
+    // /Library/Filesystems/mntfs.fs makes them show "Windows NT File System
+    // (NTFS)" instead of a bogus "ExFAT" / "Unknown (mntfs)". Requires one admin
+    // authorization; optional (everything works without it, just mislabeled).
+
+    static let labelBundlePath = "/Library/Filesystems/mntfs.fs"
+
+    static let labelBundleInfoPlist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+    \t<key>CFBundleDevelopmentRegion</key><string>English</string>
+    \t<key>CFBundleIdentifier</key><string>com.fastntfs.filesystems.mntfs</string>
+    \t<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    \t<key>CFBundleName</key><string>mntfs</string>
+    \t<key>CFBundlePackageType</key><string>fs  </string>
+    \t<key>CFBundleShortVersionString</key><string>1.0</string>
+    \t<key>CFBundleVersion</key><string>1.0</string>
+    \t<key>FSImplementation</key><array><string>UserFS</string></array>
+    \t<key>FSPersonalities</key>
+    \t<dict>
+    \t\t<key>NTFS</key>
+    \t\t<dict>
+    \t\t\t<key>FSName</key><string>Windows NT File System (NTFS)</string>
+    \t\t</dict>
+    \t</dict>
+    </dict>
+    </plist>
+    """
+
+    nonisolated static func labelSupportInstalled() -> Bool {
+        guard let d = FileManager.default.contents(atPath: labelBundlePath + "/Contents/Info.plist"),
+              let pl = (try? PropertyListSerialization.propertyList(from: d, options: [], format: nil))
+                as? [String: Any] else { return false }
+        return (pl["CFBundleName"] as? String) == "mntfs"
+    }
+
+    func maybeOfferLabelSupport() {
+        guard !Self.labelSupportInstalled(),
+              !UserDefaults.standard.bool(forKey: "labelSupportDeclined") else { return }
+        offerLabelSupport = true
+    }
+
+    func declineLabelSupport() {
+        offerLabelSupport = false
+        UserDefaults.standard.set(true, forKey: "labelSupportDeclined")
+    }
+
+    func installLabelSupport() {
+        offerLabelSupport = false
+        Task.detached(priority: .userInitiated) {
+            let ok = Self.doInstallLabelSupport()
+            // Finder/Disk Utility cache a volume's display name from mount time,
+            // so already-mounted NTFS drives keep the old "ExFAT"/"Unknown" label
+            // until remounted. Remount them once so the new name shows immediately.
+            if ok { Self.remountNTFSVolumes() }
+            await MainActor.run {
+                self.actionMessage = ok
+                    ? "Done — NTFS drives now show as “Windows NT File System (NTFS)” in Finder and Disk Utility."
+                    : "Could not install NTFS name support (admin authorization is required)."
+                self.refresh()
+            }
+        }
+    }
+
+    /// Remount every volume our driver has mounted ("mntfs"), so Finder and
+    /// Disk Utility re-read the (now installed) display name. Best-effort:
+    /// a busy volume that won't unmount is simply left as-is.
+    nonisolated private static func remountNTFSVolumes() {
+        var buf: UnsafeMutablePointer<statfs>?
+        let n = getmntinfo(&buf, MNT_NOWAIT)
+        guard n > 0, let buf else { return }
+        var devs: [String] = []
+        for i in 0..<Int(n) {
+            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
+                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            guard t == "mntfs" else { continue }
+            let dev = withUnsafeBytes(of: buf[i].f_mntfromname) {
+                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            devs.append(dev)
+        }
+        for dev in devs where run(["unmount", dev]) != nil {
+            _ = run(["mount", dev])
+        }
+    }
+
+    nonisolated private static func doInstallLabelSupport() -> Bool {
+        let fm = FileManager.default
+        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("mntfs.fs")
+        try? fm.removeItem(atPath: tmp)
+        do {
+            try fm.createDirectory(atPath: tmp + "/Contents/Resources",
+                                   withIntermediateDirectories: true)
+            try labelBundleInfoPlist.write(toFile: tmp + "/Contents/Info.plist",
+                                           atomically: true, encoding: .utf8)
+        } catch { return false }
+        let script = "rm -rf '\(labelBundlePath)' && cp -R '\(tmp)' '\(labelBundlePath)' "
+                   + "&& chown -R root:wheel '\(labelBundlePath)'"
+        let esc = script.replacingOccurrences(of: "\\", with: "\\\\")
+                        .replacingOccurrences(of: "\"", with: "\\\"")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", "do shell script \"\(esc)\" with administrator privileges"]
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0 && labelSupportInstalled()
+    }
+
     private func apply(_ all: [VolumeItem]) {
         usingSampleData = all.isEmpty
         let items = all.isEmpty ? Self.sample() : all
@@ -271,9 +401,11 @@ final class VolumeStore: ObservableObject {
             as? [String: Any]
     }
 
-    /// Kernel filesystem type for a mount point (statfs f_fstypename): "mntfs",
-    /// "exfat", "ntfs", "apfs"… This is the ground truth. diskutil's
-    /// FilesystemType/Name both misreport our FSKit NTFS volumes as "exfat".
+    /// Kernel filesystem type for a mount point (statfs f_fstypename): "ntfs",
+    /// "exfat", "apfs"… This is the ground truth. Our driver reports "ntfs"
+    /// (same as Apple's read-only handler — telling them apart needs the
+    /// writable flag), while diskutil's FilesystemType/Name still misreport
+    /// FSKit NTFS volumes as "exfat".
     nonisolated private static func mountFSType(_ path: String) -> String {
         var s = statfs()
         guard statfs(path, &s) == 0 else { return "" }
@@ -282,8 +414,9 @@ final class VolumeStore: ObservableObject {
         }
     }
 
-    /// True if any volume is currently mounted by our driver ("mntfs"): a
-    /// definitive sign the extension is enabled and working right now.
+    /// True if any NTFS volume is mounted READ/WRITE. Only our FSKit driver
+    /// mounts NTFS writable (Apple's built-in handler is read-only), so a
+    /// writable "ntfs" mount is a definitive sign the extension is working now.
     nonisolated static func hasMntfsMount() -> Bool {
         var buf: UnsafeMutablePointer<statfs>?
         let n = getmntinfo(&buf, MNT_NOWAIT)
@@ -292,9 +425,64 @@ final class VolumeStore: ObservableObject {
             let t = withUnsafeBytes(of: buf[i].f_fstypename) {
                 String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
             }
-            if t == "mntfs" { return true }
+            let readOnly = (buf[i].f_flags & UInt32(MNT_RDONLY)) != 0
+            if (t == "ntfs" || t == "mntfs") && !readOnly { return true }
         }
         return false
+    }
+
+    /// After boot (or if Apple's handler wins the race), an NTFS drive that was
+    /// already connected mounts read-only as "ntfs". Our driver never mounts
+    /// read-only, so any read-only "ntfs" volume is Apple's — unmount and remount
+    /// it once so DiskArbitration re-probes and our writable "mntfs" driver
+    /// (probe order 500, ahead of Apple's 1000) claims it. This is what makes
+    /// drives writable right after login without a manual replug.
+    func autoRemountReadOnlyNTFS() {
+        Task.detached(priority: .utility) {
+            // Pointless (and loop-prone) unless our extension is actually enabled.
+            guard Self.extensionEnabled() else { return }
+            let devs = Self.readOnlyAppleNTFSDevices()
+            guard !devs.isEmpty else { return }
+            let todo: [String] = await MainActor.run {
+                let fresh = devs.filter { !self.remountAttempted.contains($0) }
+                fresh.forEach { self.remountAttempted.insert($0) }
+                return fresh
+            }
+            guard !todo.isEmpty else { return }
+            for dev in todo {
+                // Right after login the extension may still be warming up, so the
+                // first remount can come back read-only again — retry a few times.
+                for _ in 0..<3 {
+                    _ = Self.run(["unmount", dev])
+                    _ = Self.run(["mount", dev])
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    if !Self.readOnlyAppleNTFSDevices().contains(dev) { break }
+                }
+            }
+            await MainActor.run { self.refresh() }
+        }
+    }
+
+    /// BSD device nodes of NTFS volumes currently mounted read-only by Apple's
+    /// built-in handler (fstype "ntfs"). Our driver uses "mntfs", so these are
+    /// exactly the ones we want to take over.
+    nonisolated private static func readOnlyAppleNTFSDevices() -> [String] {
+        var buf: UnsafeMutablePointer<statfs>?
+        let n = getmntinfo(&buf, MNT_NOWAIT)
+        guard n > 0, let buf else { return [] }
+        var out: [String] = []
+        for i in 0..<Int(n) {
+            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
+                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            let readOnly = (buf[i].f_flags & UInt32(MNT_RDONLY)) != 0
+            guard t == "ntfs", readOnly else { continue }
+            let dev = withUnsafeBytes(of: buf[i].f_mntfromname) {
+                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            out.append(dev)
+        }
+        return out
     }
 
     nonisolated private static func enumerate() -> [VolumeItem] {
@@ -932,7 +1120,7 @@ private struct DonateCard: View {
 // MARK: - Root
 
 struct ContentView: View {
-    @StateObject private var store = VolumeStore()
+    @ObservedObject var store: VolumeStore
     var body: some View {
         HStack(spacing: 0) {
             Sidebar(store: store).frame(width: 288)
@@ -953,6 +1141,17 @@ struct ContentView: View {
             Button("OK", role: .cancel) { store.actionMessage = nil }
         } message: {
             Text(store.actionMessage ?? "")
+        }
+        .alert("Show NTFS drives correctly?", isPresented: Binding(
+            get: { store.offerLabelSupport },
+            set: { if !$0 { store.offerLabelSupport = false } })) {
+            Button("Install") { store.installLabelSupport() }
+            Button("Not Now", role: .cancel) { store.declineLabelSupport() }
+        } message: {
+            Text("Finder and Disk Utility mislabel NTFS drives as “ExFAT”. "
+               + "MNtfs can install a small system component so they show "
+               + "“Windows NT File System (NTFS)” correctly. This needs your "
+               + "administrator password once. Reading and writing work either way.")
         }
         .sheet(item: Binding(get: { store.eraseTarget },
                              set: { store.eraseTarget = $0 })) { target in
@@ -1016,4 +1215,4 @@ private struct EraseSheet: View {
     }
 }
 
-#Preview { ContentView() }
+#Preview { ContentView(store: VolumeStore()) }
