@@ -59,6 +59,8 @@ xcrun notarytool submit "$DMG" --key "$KEY" --key-id "$KID" --issuer "$ISS" --wa
 xcrun stapler staple "$DMG"
 
 echo "==> 6/6  Verify"
-spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 | head -2
-xcrun stapler validate "$DMG" 2>&1 | tail -1
+# No pipes here: with `set -e`, piping into head/tail would hide a failing
+# spctl/stapler behind the pipe's exit status and let a bad DMG ship.
+spctl -a -vvv -t open --context context:primary-signature "$DMG"
+xcrun stapler validate "$DMG"
 echo "Done: $DMG"

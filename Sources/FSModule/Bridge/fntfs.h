@@ -78,6 +78,20 @@ enum {
     FNTFS_PROBE_UNRECOGNIZED = 2, /* not NTFS                         */
 };
 
+/* Volume-state flags reported by fntfs_check_state. */
+#define FNTFS_VSTATE_DIRTY      (1u << 0)  /* dirty bit set in $Volume        */
+#define FNTFS_VSTATE_HIBERNATED (1u << 1)  /* valid hibernation image present */
+#define FNTFS_VSTATE_LOG_DIRTY  (1u << 2)  /* $LogFile has pending state      */
+
+/*
+ * Inspect an unmounted volume's consistency state without modifying anything
+ * (read-only mount). Returns 0 with *state_out filled (0 == clean), or -errno
+ * if the device cannot be read as NTFS at all.
+ */
+int fntfs_check_state(void *_Nullable ctx, fntfs_pread_cb _Nonnull pread_cb,
+                      uint64_t dev_size, uint32_t sector_size,
+                      uint32_t *_Nonnull state_out);
+
 /*
  * Probe a device. Attempts a read-only mount to fetch the volume label and
  * serial; falls back to a boot-sector check. name_out must hold >= 256 bytes.
@@ -146,6 +160,23 @@ int fntfs_create(fntfs_vol *_Nonnull v, uint64_t dir,
 int fntfs_remove(fntfs_vol *_Nonnull v, uint64_t dir,
                  const char *_Nonnull name, uint64_t inum);
 
+/*
+ * Unlink dir/name for a file that is still open, honouring POSIX open-unlink
+ * semantics. If this is the inode's only real name (DOS 8.3 aliases don't
+ * count), the inode is kept alive under a hidden "ghost" name in the root
+ * directory and ghost_out (>= 64 bytes) receives that name; the caller
+ * finalizes the delete later with fntfs_remove(v, fntfs_root_inum(), ghost,
+ * inum) once the last handle closes. If other names remain, this is a plain
+ * remove and ghost_out is set to "". The link-count decision happens inside
+ * the volume lock, so concurrent unlinks of sibling hard links cannot both
+ * conclude "others remain". Ghost entries are hidden from fntfs_readdir and
+ * swept on the next read-write mount, so nothing leaks even if the process
+ * dies before finalizing.
+ */
+int fntfs_unlink_keep(fntfs_vol *_Nonnull v, uint64_t dir,
+                      const char *_Nonnull name, uint64_t inum,
+                      char *_Nonnull ghost_out);
+
 /* Hard link `inum` into `dir` as `name`. */
 int fntfs_link(fntfs_vol *_Nonnull v, uint64_t inum, uint64_t dir,
                const char *_Nonnull name);
@@ -163,6 +194,20 @@ int fntfs_rename(fntfs_vol *_Nonnull v, uint64_t inum,
                  uint64_t dst_dir, const char *_Nonnull dst_name,
                  uint64_t over_inum);
 
+/*
+ * Like fntfs_rename, but when `over_ghost_out` (>= 64 bytes) is non-NULL and
+ * the replaced inode's last real name is the destination name, the inode is
+ * NOT deleted: it survives under a hidden del-ghost in the root directory
+ * whose name is returned in over_ghost_out (same finalize contract as
+ * fntfs_unlink_keep). Use when the destination item is still open somewhere.
+ * over_ghost_out is set to "" when nothing was kept (no overwrite, or other
+ * names keep the inode alive anyway).
+ */
+int fntfs_rename2(fntfs_vol *_Nonnull v, uint64_t inum,
+                  uint64_t src_dir, const char *_Nonnull src_name,
+                  uint64_t dst_dir, const char *_Nonnull dst_name,
+                  uint64_t over_inum, char *_Nullable over_ghost_out);
+
 int fntfs_truncate(fntfs_vol *_Nonnull v, uint64_t inum, uint64_t size);
 
 int fntfs_settimes(fntfs_vol *_Nonnull v, uint64_t inum,
@@ -171,8 +216,9 @@ int fntfs_settimes(fntfs_vol *_Nonnull v, uint64_t inum,
 /* Set/clear FNTFS_WINATTR_* bits. */
 int fntfs_setwinattrs(fntfs_vol *_Nonnull v, uint64_t inum, uint32_t win_attrs);
 
-/* Drop a cached open file handle, if any (call from reclaim). */
-void fntfs_forget(fntfs_vol *_Nonnull v, uint64_t inum);
+/* Drop a cached open file handle, if any (call from reclaim). Returns 0, or
+   -errno if flushing the handle's dirty state to disk failed. */
+int fntfs_forget(fntfs_vol *_Nonnull v, uint64_t inum);
 
 /* Volume label (UTF-8, may be empty). Buffer >= 256 bytes. */
 void fntfs_volname(fntfs_vol *_Nonnull v, char *_Nonnull out);

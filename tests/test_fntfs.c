@@ -30,6 +30,7 @@
 } while (0)
 
 static int g_fd;
+static int64_t g_max_io;   /* largest single device I/O since last reset */
 
 static int64_t cb_pread(void *ctx, void *buf, int64_t count, int64_t offset)
 {
@@ -37,6 +38,7 @@ static int64_t cb_pread(void *ctx, void *buf, int64_t count, int64_t offset)
     CHECK(offset % SECTOR == 0 && count % SECTOR == 0,
           "unaligned pread off=%lld len=%lld", (long long)offset,
           (long long)count);
+    if (count > g_max_io) g_max_io = count;
     ssize_t r = pread(g_fd, buf, (size_t)count, offset);
     return r < 0 ? -errno : r;
 }
@@ -48,9 +50,19 @@ static int64_t cb_pwrite(void *ctx, const void *buf, int64_t count,
     CHECK(offset % SECTOR == 0 && count % SECTOR == 0,
           "unaligned pwrite off=%lld len=%lld", (long long)offset,
           (long long)count);
+    if (count > g_max_io) g_max_io = count;
     ssize_t r = pwrite(g_fd, buf, (size_t)count, offset);
     return r < 0 ? -errno : r;
 }
+
+/* White-box hooks from fntfs.c (compiled with -DFNTFS_TESTING). */
+extern int64_t fntfs_test_pread_aligned(void *ctx, fntfs_pread_cb pr,
+                                        uint64_t dev_size, uint32_t sector,
+                                        void *buf, int64_t count, int64_t off);
+extern int64_t fntfs_test_pwrite_aligned(void *ctx, fntfs_pread_cb pr,
+                                         fntfs_pwrite_cb pw, uint64_t dev_size,
+                                         uint32_t sector, const void *buf,
+                                         int64_t count, int64_t off);
 
 static int cb_flush(void *ctx)
 {
@@ -248,6 +260,147 @@ int main(int argc, char **argv)
     CHECK(r == 3 && !memcmp(rbuf, "SRC", 3), "overwrite kept source data");
     printf("overwrite rename ok\n");
 
+    /* --- rename onto a NON-EMPTY directory must fail with ENOTEMPTY --- */
+    fntfs_attrs dst_d, src_d, inner;
+    CHECK(fntfs_create(v, root, "dstdir", true, &dst_d) == 0, "mkdir dstdir");
+    CHECK(fntfs_create(v, dst_d.inum, "inside.txt", false, &inner) == 0,
+          "populate dstdir");
+    CHECK(fntfs_create(v, root, "srcdir", true, &src_d) == 0, "mkdir srcdir");
+    CHECK(fntfs_rename(v, src_d.inum, root, "srcdir",
+                       root, "dstdir", dst_d.inum) == -ENOTEMPTY,
+          "overwrite of non-empty dir must be ENOTEMPTY");
+    CHECK(fntfs_lookup(v, root, "dstdir", &la) == 0 && la.inum == dst_d.inum,
+          "dst dir intact after refused rename");
+    CHECK(fntfs_lookup(v, dst_d.inum, "inside.txt", &la) == 0,
+          "dst dir content intact");
+    struct entlist elg = {0};
+    CHECK(fntfs_readdir(v, root, 0, &elg, collect_cb) == 0, "readdir ghosts");
+    for (int i = 0; i < elg.n; i++)
+        CHECK(strncmp(elg.names[i], ".mntfs-", 7) != 0,
+              "ghost leaked: %s", elg.names[i]);
+
+    /* --- POSIX type rules: file over dir = EISDIR, dir over file = ENOTDIR */
+    fntfs_attrs plain;
+    CHECK(fntfs_create(v, root, "plain.txt", false, &plain) == 0, "create plain");
+    CHECK(fntfs_rename(v, plain.inum, root, "plain.txt",
+                       root, "dstdir", dst_d.inum) == -EISDIR, "file over dir");
+    CHECK(fntfs_rename(v, src_d.inum, root, "srcdir",
+                       root, "plain.txt", plain.inum) == -ENOTDIR,
+          "dir over file");
+
+    /* --- an EMPTY directory target is replaceable --- */
+    CHECK(fntfs_remove(v, dst_d.inum, "inside.txt", inner.inum) == 0,
+          "empty out dstdir");
+    CHECK(fntfs_rename(v, src_d.inum, root, "srcdir",
+                       root, "dstdir", dst_d.inum) == 0, "dir over empty dir");
+    CHECK(fntfs_lookup(v, root, "dstdir", &la) == 0 && la.inum == src_d.inum,
+          "empty dir replaced");
+    CHECK(fntfs_lookup(v, root, "srcdir", &la) == -ENOENT, "src dir name gone");
+    CHECK(fntfs_remove(v, root, "plain.txt", plain.inum) == 0, "rm plain");
+
+    /* --- a directory must not move into its own subtree --- */
+    fntfs_attrs par, chi;
+    CHECK(fntfs_create(v, root, "parent", true, &par) == 0, "mkdir parent");
+    CHECK(fntfs_create(v, par.inum, "child", true, &chi) == 0, "mkdir child");
+    CHECK(fntfs_rename(v, par.inum, root, "parent",
+                       chi.inum, "oops", 0) == -EINVAL,
+          "move into descendant rejected");
+    CHECK(fntfs_rename(v, par.inum, root, "parent",
+                       par.inum, "oops", 0) == -EINVAL,
+          "move into self rejected");
+    CHECK(fntfs_remove(v, par.inum, "child", chi.inum) == 0, "rm child");
+    CHECK(fntfs_remove(v, root, "parent", par.inum) == 0, "rm parent");
+    printf("rename safety checks ok\n");
+
+    /* --- hard links to the same inode: rename is a POSIX no-op --- */
+    fntfs_attrs hl;
+    CHECK(fntfs_create(v, root, "orig.txt", false, &hl) == 0, "create orig");
+    CHECK(fntfs_write(v, hl.inum, "HL", 2, 0) == 2, "write orig");
+    CHECK(fntfs_link(v, hl.inum, root, "alias.txt") == 0, "link alias");
+    CHECK(fntfs_rename(v, hl.inum, root, "orig.txt",
+                       root, "alias.txt", hl.inum) == 0, "same-inode rename");
+    CHECK(fntfs_lookup(v, root, "orig.txt", &la) == 0, "orig still present");
+    CHECK(fntfs_lookup(v, root, "alias.txt", &la) == 0, "alias still present");
+    CHECK(fntfs_remove(v, root, "alias.txt", hl.inum) == 0, "rm alias");
+
+    /* --- case-insensitive lookup, collision, case-change rename --- */
+    CHECK(fntfs_lookup(v, root, "ORIG.TXT", &la) == 0 && la.inum == hl.inum,
+          "case-insensitive lookup");
+    fntfs_attrs coll;
+    CHECK(fntfs_create(v, root, "OrIg.TxT", false, &coll) == -EEXIST,
+          "case-colliding create rejected");
+    CHECK(fntfs_rename(v, hl.inum, root, "orig.txt",
+                       root, "ORIG.txt", hl.inum) == 0, "case-change rename");
+    struct entlist elc = {0};
+    CHECK(fntfs_readdir(v, root, 0, &elc, collect_cb) == 0, "readdir case");
+    CHECK(list_has(&elc, "ORIG.txt") >= 0, "new spelling listed");
+    CHECK(list_has(&elc, "orig.txt") < 0, "old spelling gone");
+    r = fntfs_read(v, hl.inum, rbuf, 2, 0);
+    CHECK(r == 2 && !memcmp(rbuf, "HL", 2), "content survives case rename");
+    CHECK(fntfs_remove(v, root, "ORIG.txt", hl.inum) == 0, "rm cased file");
+    printf("case-insensitive semantics ok\n");
+
+    /* --- open-unlink: park, stay readable, invisible, finalize --- */
+    fntfs_attrs ou;
+    CHECK(fntfs_create(v, root, "openfile.txt", false, &ou) == 0,
+          "create openfile");
+    CHECK(fntfs_write(v, ou.inum, "STILL-OPEN", 10, 0) == 10, "write openfile");
+    char ghost[64];
+    CHECK(fntfs_unlink_keep(v, root, "openfile.txt", ou.inum, ghost) == 0,
+          "unlink_keep");
+    CHECK(fntfs_lookup(v, root, "openfile.txt", &la) == -ENOENT,
+          "unlinked name gone");
+    r = fntfs_read(v, ou.inum, rbuf, 10, 0);
+    CHECK(r == 10 && !memcmp(rbuf, "STILL-OPEN", 10),
+          "unlinked-but-open file still readable");
+    struct entlist elu = {0};
+    CHECK(fntfs_readdir(v, root, 0, &elu, collect_cb) == 0, "readdir unlink");
+    for (int i = 0; i < elu.n; i++)
+        CHECK(strncmp(elu.names[i], ".mntfs-", 7) != 0,
+              "unlink ghost visible: %s", elu.names[i]);
+    CHECK(fntfs_remove(v, root, ghost, ou.inum) == 0, "finalize unlinked");
+
+    /* unlink_keep of one of several hard links: plain remove, no ghost */
+    fntfs_attrs mh;
+    CHECK(fntfs_create(v, root, "multi.txt", false, &mh) == 0, "create multi");
+    CHECK(fntfs_link(v, mh.inum, root, "multi2.txt") == 0, "link multi2");
+    char ghostm[64] = "x";
+    CHECK(fntfs_unlink_keep(v, root, "multi.txt", mh.inum, ghostm) == 0,
+          "unlink_keep hardlinked");
+    CHECK(ghostm[0] == '\0', "no ghost for hardlinked file");
+    CHECK(fntfs_lookup(v, root, "multi.txt", &la) == -ENOENT, "multi gone");
+    CHECK(fntfs_lookup(v, root, "multi2.txt", &la) == 0 && la.inum == mh.inum,
+          "second link intact");
+    CHECK(fntfs_remove(v, root, "multi2.txt", mh.inum) == 0, "rm multi2");
+
+    /* overwrite-rename that must KEEP the open destination (rename2) */
+    fntfs_attrs rs, rd;
+    CHECK(fntfs_create(v, root, "new.cfg", false, &rs) == 0, "create new.cfg");
+    CHECK(fntfs_create(v, root, "cur.cfg", false, &rd) == 0, "create cur.cfg");
+    CHECK(fntfs_write(v, rs.inum, "NEW", 3, 0) == 3, "write new.cfg");
+    CHECK(fntfs_write(v, rd.inum, "OLD-DATA", 8, 0) == 8, "write cur.cfg");
+    char kghost[64] = "";
+    CHECK(fntfs_rename2(v, rs.inum, root, "new.cfg", root, "cur.cfg",
+                        rd.inum, kghost) == 0, "rename2 keep-over");
+    CHECK(kghost[0] != '\0', "replaced inode parked under a ghost");
+    CHECK(fntfs_lookup(v, root, "cur.cfg", &la) == 0 && la.inum == rs.inum,
+          "dest name maps to source");
+    r = fntfs_read(v, rd.inum, rbuf, 8, 0);
+    CHECK(r == 8 && !memcmp(rbuf, "OLD-DATA", 8),
+          "replaced-but-open inode still readable");
+    CHECK(fntfs_remove(v, root, kghost, rd.inum) == 0, "finalize kept over");
+    CHECK(fntfs_remove(v, root, "cur.cfg", rs.inum) == 0, "rm cur.cfg");
+
+    /* leave one ghost behind on purpose: the next rw mount must sweep it */
+    fntfs_attrs ou2;
+    CHECK(fntfs_create(v, root, "crashfile.txt", false, &ou2) == 0,
+          "create crashfile");
+    char ghost2[64];
+    CHECK(fntfs_unlink_keep(v, root, "crashfile.txt", ou2.inum, ghost2) == 0,
+          "unlink_keep crashfile");
+    CHECK(ghost2[0] != '\0', "crashfile parked under a ghost");
+    printf("open-unlink semantics ok\n");
+
     /* --- hard link --- */
     CHECK(fntfs_link(v, fa.inum, root, "hardlink.txt") == 0, "hardlink");
     CHECK(fntfs_getattr(v, fa.inum, &a) == 0 && a.nlink >= 2, "nlink=%u", a.nlink);
@@ -285,7 +438,7 @@ int main(int argc, char **argv)
     CHECK(fntfs_unmount(v) == 0, "unmount");
     printf("unmounted\n");
 
-    /* --- remount, verify persistence --- */
+    /* --- remount, verify persistence + ghost sweep --- */
     v = fntfs_mount(NULL, cb_pread, cb_pwrite, cb_flush, dev_size, SECTOR,
                     false, name, &serial, &err);
     CHECK(v, "remount err=%d", err);
@@ -297,7 +450,62 @@ int main(int argc, char **argv)
     int bi = list_has(&el3, "big.bin");
     CHECK(fntfs_getattr(v, el3.inums[bi], &a) == 0 && a.size == 100000,
           "persisted size");
+    /* the ghost left by the "crashed" unlink_keep must have been swept */
+    CHECK(fntfs_lookup(v, root, ghost2, &la) == -ENOENT,
+          "leftover ghost swept at remount");
     CHECK(fntfs_unmount(v) == 0, "unmount 2");
+    printf("ghost sweep ok\n");
+
+    /* --- consistency check on the (clean) unmounted image --- */
+    uint32_t vstate = 0xffffffffu;
+    CHECK(fntfs_check_state(NULL, cb_pread, dev_size, SECTOR, &vstate) == 0,
+          "check_state");
+    CHECK(vstate == 0, "volume should be clean, state=0x%x", vstate);
+    printf("check_state ok (clean)\n");
+
+    /* --- bounce-buffer clamping (white-box; trashes the image, keep last) --- */
+    char pat[300], chk[600];
+    for (int i = 0; i < 300; i++) pat[i] = (char)(i ^ 0x5a);
+
+    g_max_io = 0;
+    CHECK(fntfs_test_pwrite_aligned(NULL, cb_pread, cb_pwrite, dev_size,
+                                    SECTOR, pat, 3, 1) == 3,
+          "tiny unaligned write");
+    CHECK(g_max_io == SECTOR, "3-byte write did %lld-byte I/O, want %d",
+          (long long)g_max_io, SECTOR);
+
+    g_max_io = 0;
+    CHECK(fntfs_test_pwrite_aligned(NULL, cb_pread, cb_pwrite, dev_size,
+                                    SECTOR, pat, 2, SECTOR - 1) == 2,
+          "sector-straddling write");
+    CHECK(g_max_io == 2 * SECTOR, "straddle did %lld-byte I/O, want %d",
+          (long long)g_max_io, 2 * SECTOR);
+
+    g_max_io = 0;
+    CHECK(fntfs_test_pread_aligned(NULL, cb_pread, dev_size, SECTOR,
+                                   chk, 5, 7) == 5, "tiny unaligned read");
+    CHECK(g_max_io == SECTOR, "5-byte read did %lld-byte I/O, want %d",
+          (long long)g_max_io, SECTOR);
+
+    CHECK(fntfs_test_pwrite_aligned(NULL, cb_pread, cb_pwrite, dev_size,
+                                    SECTOR, pat, 300, 777) == 300,
+          "pattern write");
+    memset(chk, 0, sizeof chk);
+    CHECK(fntfs_test_pread_aligned(NULL, cb_pread, dev_size, SECTOR,
+                                   chk, 300, 777) == 300, "pattern read");
+    CHECK(!memcmp(chk, pat, 300), "unaligned roundtrip intact");
+
+    size_t bigw = (2u << 20) + 5;
+    char *bw = malloc(bigw);
+    for (size_t i = 0; i < bigw; i++) bw[i] = (char)i;
+    g_max_io = 0;
+    CHECK(fntfs_test_pwrite_aligned(NULL, cb_pread, cb_pwrite, dev_size, SECTOR,
+                                    bw, (int64_t)bigw, 1) == (int64_t)bigw,
+          "large unaligned write");
+    CHECK(g_max_io == (1 << 20), "large write chunked at %lld, want %d",
+          (long long)g_max_io, 1 << 20);
+    free(bw);
+    printf("bounce clamping ok\n");
 
     close(g_fd);
     printf("ALL TESTS PASSED\n");

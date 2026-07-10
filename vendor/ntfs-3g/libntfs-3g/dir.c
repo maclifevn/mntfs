@@ -997,27 +997,18 @@ static int ntfs_filldir(ntfs_inode *dir_ni, s64 *pos, u8 ivcn_bits,
 				|| !(fn->file_attributes & FILE_ATTR_HIDDEN)))
             || (NVolShowSysFiles(dir_ni->vol) && (NVolShowHidFiles(dir_ni->vol)
 				|| metadata))) {
-		if (NVolCaseSensitive(dir_ni->vol)) {
-			res = filldir(dirent, fn->file_name,
-					fn->file_name_length,
-					fn->file_name_type, *pos,
-					mref, dt_type);
-		} else {
-			loname = (ntfschar*)ntfs_malloc(2*fn->file_name_length);
-			if (loname) {
-				memcpy(loname, fn->file_name,
-					2*fn->file_name_length);
-				ntfs_name_locase(loname, fn->file_name_length,
-					dir_ni->vol->locase,
-					dir_ni->vol->upcase_len);
-				res = filldir(dirent, loname,
-					fn->file_name_length,
-					fn->file_name_type, *pos,
-					mref, dt_type);
-				free(loname);
-			} else
-				res = -1;
-		}
+		/*
+		 * MNtfs: always return the on-disk name, even in ignore-case
+		 * mode. Upstream lowercases names here (lowntfs-3g
+		 * behaviour), but this driver is case-insensitive and
+		 * case-PRESERVING: lookups fold case, listings must show the
+		 * name exactly as stored.
+		 */
+		(void)loname;
+		res = filldir(dirent, fn->file_name,
+				fn->file_name_length,
+				fn->file_name_type, *pos,
+				mref, dt_type);
 	} else
 		res = 0;
 	return (res);

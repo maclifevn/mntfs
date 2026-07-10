@@ -142,6 +142,9 @@ struct VolumeItem: Identifiable, Hashable {
     var nobrowse: Bool
     var usedBytes: Int64
     var freeBytes: Int64
+    /// True for the placeholder rows shown when no volumes are detected.
+    /// Sample rows must never reach diskutil/mkntfs.
+    var isSample: Bool = false
 
     var mounted: Bool { mountPoint != nil }
     var displayName: String { name.isEmpty ? "Untitled" : name }
@@ -266,9 +269,9 @@ final class VolumeStore: ObservableObject {
     // (NTFS)" instead of a bogus "ExFAT" / "Unknown (mntfs)". Requires one admin
     // authorization; optional (everything works without it, just mislabeled).
 
-    static let labelBundlePath = "/Library/Filesystems/mntfs.fs"
+    nonisolated static let labelBundlePath = "/Library/Filesystems/mntfs.fs"
 
-    static let labelBundleInfoPlist = """
+    nonisolated static let labelBundleInfoPlist = """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
     <plist version="1.0">
@@ -588,7 +591,18 @@ final class VolumeStore: ObservableObject {
         return items
     }
 
+    /// True when `v` is a real volume that diskutil may act on. Sample rows
+    /// (and anything without a /dev/disk path) are display-only.
+    private func actionable(_ v: VolumeItem) -> Bool {
+        if v.isSample || usingSampleData || !v.device.hasPrefix("/dev/disk") {
+            actionMessage = "This is sample data — plug in a real drive first."
+            return false
+        }
+        return true
+    }
+
     func toggleMount(_ v: VolumeItem) {
+        guard actionable(v) else { return }
         let mounting = !v.mounted
         Task.detached(priority: .userInitiated) {
             let r = Self.run([mounting ? "mount" : "unmount", v.device])
@@ -604,6 +618,7 @@ final class VolumeStore: ObservableObject {
     }
 
     func verify(_ v: VolumeItem) {
+        guard actionable(v) else { return }
         verifying = true
         Task.detached(priority: .userInitiated) {
             let r = Self.run(["verifyVolume", v.device])
@@ -617,9 +632,12 @@ final class VolumeStore: ObservableObject {
     // MARK: Erase / reformat as NTFS
 
     func erase(_ v: VolumeItem, newName: String) {
+        guard actionable(v) else { eraseTarget = nil; return }
         erasing = true
         Task.detached(priority: .userInitiated) {
-            let result = Self.performErase(device: v.device, name: newName)
+            let result = Self.performErase(device: v.device, name: newName,
+                                           expectedSize: v.sizeBytes,
+                                           expectedContent: v.content)
             await MainActor.run {
                 self.erasing = false
                 self.eraseTarget = nil
@@ -633,17 +651,64 @@ final class VolumeStore: ObservableObject {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    nonisolated private static func performErase(device: String, name: String) -> String {
+    nonisolated private static func performErase(device: String, name: String,
+                                                 expectedSize: Int64,
+                                                 expectedContent: String) -> String {
+        guard device.hasPrefix("/dev/disk") else {
+            return "Erase refused: no real device selected."
+        }
         guard let mkntfs = Bundle.main.path(forResource: "mkntfs", ofType: nil) else {
             return "Erase failed: the mkntfs formatter is missing from the app bundle."
         }
         // The user has confirmed destruction, so force the volume unmounted to
         // be sure mkntfs can take the raw partition.
-        _ = run(["unmount", "force", device])
+        let um = run(["unmount", "force", device])
+
+        // Revalidate the target before touching it: it must still exist, be
+        // the same partition the user selected (same partition type and size —
+        // device numbers get reshuffled when drives are re/unplugged), and be
+        // unmounted now. Formatting a moved or still-mounted volume would
+        // destroy the wrong data.
+        let info = run(["info", "-plist", device])
+        guard info.ok,
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: info.out, format: nil),
+              let d = plist as? [String: Any] else {
+            return "Erase aborted: \(device) is no longer readable (unplugged?)."
+        }
+        if let mp = d["MountPoint"] as? String, !mp.isEmpty {
+            return "Erase aborted: \(device) could not be unmounted"
+                + (um.text.isEmpty ? "." : ":\n\(um.text)")
+        }
+        let contentNow = d["Content"] as? String ?? ""
+        guard expectedContent.isEmpty || contentNow == expectedContent else {
+            return "Erase aborted: \(device) is not the partition that was selected (type changed)."
+        }
+        let sizeNow = (d["TotalSize"] as? NSNumber)?.int64Value
+            ?? (d["Size"] as? NSNumber)?.int64Value ?? -1
+        guard sizeNow == expectedSize else {
+            return "Erase aborted: \(device) is not the partition that was selected (size changed)."
+        }
+        guard (d["Ejectable"] as? Bool) ?? false else {
+            return "Erase aborted: \(device) is not a removable drive."
+        }
 
         // Sanitize the label; mkntfs -Q quick-formats, -F forces past warnings.
         let label = String(name.prefix(32)).filter { $0 != "\"" && $0 != "'" && $0 != "\\" }
-        let shell = "\(shQuote(mkntfs)) -Q -F -L \(shQuote(label)) \(shQuote(device))"
+
+        // The admin-password dialog below can sit open for minutes, during
+        // which drives can be un/replugged and device numbers reshuffled. So
+        // the identity check must ALSO run inside the privileged shell,
+        // immediately before mkntfs writes — the pre-check above only gives
+        // early, friendly errors.
+        let q = shQuote(device)
+        var recheck = "test \"$(diskutil info -plist \(q) | plutil -extract TotalSize raw -)\" = \(shQuote(String(expectedSize)))"
+        recheck += " && test -z \"$(diskutil info -plist \(q) | plutil -extract MountPoint raw - 2>/dev/null)\""
+        if !expectedContent.isEmpty {
+            recheck += " && test \"$(diskutil info -plist \(q) | plutil -extract Content raw -)\" = \(shQuote(expectedContent))"
+        }
+        let shell = "{ \(recheck) ; } || { echo MNTFS_TARGET_CHANGED; exit 90; }; "
+            + "\(shQuote(mkntfs)) -Q -F -L \(shQuote(label)) \(q)"
         let esc = shell.replacingOccurrences(of: "\\", with: "\\\\")
                        .replacingOccurrences(of: "\"", with: "\\\"")
         let appleScript = "do shell script \"\(esc)\" with administrator privileges"
@@ -664,6 +729,9 @@ final class VolumeStore: ObservableObject {
         if p.terminationStatus == 0 {
             return "Reformatted \(device) as NTFS “\(label)”."
         }
+        if outText.contains("MNTFS_TARGET_CHANGED") {
+            return "Erase aborted: \(device) changed while waiting for authorization — nothing was formatted. Plug the drive back in and try again."
+        }
         if outText.contains("-128") || outText.localizedCaseInsensitiveContains("cancel") {
             return "Erase cancelled."
         }
@@ -677,35 +745,38 @@ final class VolumeStore: ObservableObject {
 
     /// Marker + user guidance shown when Erase is blocked by missing
     /// Full Disk Access. The alert adds an "Open Settings" button for it.
-    static let fdaMessage = "MNtfs needs Full Disk Access to reformat external drives.\n\nOpen System Settings → Privacy & Security → Full Disk Access, add MNtfs and turn it ON, then quit and reopen MNtfs and try again."
+    nonisolated static let fdaMessage = "MNtfs needs Full Disk Access to reformat external drives.\n\nOpen System Settings → Privacy & Security → Full Disk Access, add MNtfs and turn it ON, then quit and reopen MNtfs and try again."
 
     func openFullDiskAccessSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
         NSWorkspace.shared.open(url)
     }
 
+    /// Placeholder rows for the empty state. No real device paths: every row
+    /// is flagged `isSample` and carries an empty `device`, so nothing here
+    /// can ever be passed to diskutil or mkntfs.
     nonisolated private static func sample() -> [VolumeItem] {
         func mk(_ id: String, _ n: String, _ gb: Double, ntfs: Bool, mounted: Bool,
-                dev: String, fs: String, content: String = "", ro: Bool = false,
+                fs: String, ro: Bool = false,
                 eject: Bool = false, nobrowse: Bool = false, usedFrac: Double = 0.5) -> VolumeItem {
             let size = Int64(gb * 1_000_000_000)
             let used = Int64(Double(size) * usedFrac)
-            return VolumeItem(id: id, name: n, sizeBytes: size, device: dev, fileSystem: fs,
-                              content: content, mountPoint: mounted ? "/Volumes/\(n)" : nil,
+            return VolumeItem(id: id, name: n, sizeBytes: size, device: "", fileSystem: fs,
+                              content: "", mountPoint: mounted ? "/Volumes/\(n)" : nil,
                               writable: !ro, ejectable: eject, isNTFS: ntfs, nobrowse: nobrowse,
-                              usedBytes: used, freeBytes: size - used)
+                              usedBytes: used, freeBytes: size - used, isSample: true)
         }
         return [
-            mk("disk4s1", "SAMSUNG T7", 1000, ntfs: true, mounted: true, dev: "/dev/disk4s1",
-               fs: "Windows NTFS", content: "Windows_NTFS", eject: true, usedFrac: 0.58),
-            mk("disk5s1", "WD Elements", 15.16, ntfs: true, mounted: true, dev: "/dev/disk5s1",
+            mk("sample1", "SAMSUNG T7", 1000, ntfs: true, mounted: true,
+               fs: "Windows NTFS", eject: true, usedFrac: 0.58),
+            mk("sample2", "WD Elements", 15.16, ntfs: true, mounted: true,
                fs: "Windows NTFS", ro: true, eject: true, usedFrac: 0.41),
-            mk("disk6s1", "Project Files", 499.93, ntfs: true, mounted: false, dev: "/dev/disk6s1",
+            mk("sample3", "Project Files", 499.93, ntfs: true, mounted: false,
                fs: "Windows NTFS", eject: true, usedFrac: 0.62),
-            mk("disk3s1", "", 0.5337, ntfs: false, mounted: false, dev: "/dev/disk3s1", fs: "EFI"),
-            mk("disk3s5", "Macintosh HD — Data", 994, ntfs: false, mounted: true,
-               dev: "/dev/disk3s5", fs: "APFS", nobrowse: true, usedFrac: 0.46),
-            mk("disk3s3", "Macintosh HD", 994, ntfs: false, mounted: true, dev: "/dev/disk3s3",
+            mk("sample4", "", 0.5337, ntfs: false, mounted: false, fs: "EFI"),
+            mk("sample5", "Macintosh HD — Data", 994, ntfs: false, mounted: true,
+               fs: "APFS", nobrowse: true, usedFrac: 0.46),
+            mk("sample6", "Macintosh HD", 994, ntfs: false, mounted: true,
                fs: "APFS", ro: true, usedFrac: 0.12),
         ]
     }
@@ -1055,15 +1126,19 @@ private struct DetailPane: View {
                 }
                 Spacer()
                 HStack(spacing: 9) {
+                    // Sample rows are display-only: no diskutil action may run.
+                    let sampleOnly = v.isSample || store.usingSampleData
                     // The boot volume at "/" can't be unmounted; hide the control.
                     if v.mountPoint != "/" {
                         PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
-                                   label: v.mounted ? "Unmount" : "Mount", prominent: true) {
+                                   label: v.mounted ? "Unmount" : "Mount", prominent: true,
+                                   disabled: sampleOnly) {
                             store.toggleMount(v)
                         }
                     }
                     PillButton(icon: "checkmark.shield",
                                label: store.verifying ? "Verifying…" : "Verify",
+                               disabled: sampleOnly,
                                busy: store.verifying) {
                         store.verify(v)
                     }
@@ -1071,7 +1146,8 @@ private struct DetailPane: View {
                     // (ejectable) NTFS volume — never the boot disk and never an
                     // internal partition (e.g. a Boot Camp / Windows system disk).
                     if v.isNTFS && v.ejectable && v.mountPoint != "/" {
-                        PillButton(icon: "trash", label: "Erase") {
+                        PillButton(icon: "trash", label: "Erase",
+                                   disabled: sampleOnly) {
                             store.eraseTarget = v
                         }
                     }
@@ -1094,7 +1170,7 @@ private struct DetailPane: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     InfoRow(k: "Status", v: v.mounted ? "Mounted" : "Not mounted", good: v.mounted)
-                    InfoRow(k: "Device", v: v.device)
+                    InfoRow(k: "Device", v: v.device.isEmpty ? "—" : v.device)
                     InfoRow(k: "Format", v: v.formatDisplay)
                     InfoRow(k: "Access", v: v.readOnly ? "Read-only" : "Read & Write",
                             access: v.readOnly ? .ro : .rw)

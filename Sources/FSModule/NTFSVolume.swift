@@ -23,8 +23,11 @@ final class NTFSVolume: FSVolume {
     private var items: [UInt64: NTFSItem] = [:]
     private let itemsLock = NSLock()
 
-    /// Bumped on every namespace mutation; doubles as directory verifier.
-    private var generation: UInt64 = 1
+    /// Per-directory change counters, used as enumeration verifiers: a
+    /// directory's counter bumps whenever an entry is added, removed, or
+    /// renamed in it, so a resumed enumeration can detect that its cookie
+    /// may no longer be valid. Starts at 1 (0 is the "initial" verifier).
+    private var dirGeneration: [UInt64: UInt64] = [:]
 
     // Ownerless volume: expose everything to the mounting user.
     private let uid: UInt32 = 99  // unknown
@@ -67,20 +70,48 @@ final class NTFSVolume: FSVolume {
         return it
     }
 
-    private func forget(_ it: NTFSItem) {
+    @discardableResult
+    private func forget(_ it: NTFSItem) -> Int32 {
         itemsLock.lock()
         if items[it.inum] === it {
             items.removeValue(forKey: it.inum)
         }
         itemsLock.unlock()
-        if let v = vol { fntfs_forget(v, it.inum) }
+        if let v = vol { return fntfs_forget(v, it.inum) }
+        return 0
     }
 
-    private func bumpGeneration() -> UInt64 {
+    private func bumpGeneration(of dirs: UInt64...) {
+        itemsLock.lock()
+        for d in dirs { dirGeneration[d] = (dirGeneration[d] ?? 1) &+ 1 }
+        itemsLock.unlock()
+    }
+
+    private func generation(of dir: UInt64) -> UInt64 {
         itemsLock.lock()
         defer { itemsLock.unlock() }
-        generation += 1
-        return generation
+        return dirGeneration[dir] ?? 1
+    }
+
+    /// Finalize an open-unlinked item: delete the ghost entry that kept its
+    /// data alive. Call once the last open handle is gone. Ghosts live in the
+    /// root directory, so root's enumeration generation is bumped too.
+    private func finalizeUnlink(_ it: NTFSItem) {
+        itemsLock.lock()
+        let ghost = it.unlinkedGhost
+        it.unlinkedGhost = nil
+        itemsLock.unlock()
+        if let ghost, let v = vol {
+            _ = fntfs_remove(v, fntfs_root_inum(), ghost, it.inum)
+            bumpGeneration(of: fntfs_root_inum())
+        }
+    }
+
+    /// Forget the change counter of a directory that no longer exists.
+    private func dropGeneration(of dir: UInt64) {
+        itemsLock.lock()
+        dirGeneration.removeValue(forKey: dir)
+        itemsLock.unlock()
     }
 
     // MARK: - Attribute conversion
@@ -222,6 +253,7 @@ extension NTFSVolume: FSVolume.Operations {
                     replyHandler reply: @escaping (Error?) -> Void) {
         itemsLock.lock()
         items.removeAll()
+        dirGeneration.removeAll()
         itemsLock.unlock()
         reply(nil)
     }
@@ -349,7 +381,10 @@ extension NTFSVolume: FSVolume.Operations {
     func reclaimItem(_ item: FSItem,
                      replyHandler reply: @escaping (Error?) -> Void) {
         if let it = item as? NTFSItem {
-            forget(it)
+            finalizeUnlink(it)   // safety net if no close arrived
+            let err = forget(it)
+            reply(err == 0 ? nil : posixError(-err))
+            return
         }
         reply(nil)
     }
@@ -377,7 +412,7 @@ extension NTFSVolume: FSVolume.Operations {
             // Best-effort: the item exists regardless, so don't fail the create
             // if only the attribute pass hits a problem.
             try? applyAttributes(v, a.inum, isFile: type == .file, newAttributes)
-            _ = bumpGeneration()
+            bumpGeneration(of: dir.inum)
             let it = item(inum: a.inum, type: Self.itemType(a.type))
             reply(it, name, nil)
         } catch {
@@ -400,9 +435,17 @@ extension NTFSVolume: FSVolume.Operations {
             let it = try requireItem(item)
             let dir = try requireItem(directory)
             let nm = try utf8Name(name)
+            // POSIX forbids hard links to directories — they'd create cycles.
+            // (The bridge's rename path may still link directories internally;
+            // that use is safe because the old name is removed in the same
+            // locked sequence.)
+            guard it.type != .directory else {
+                reply(nil, posixError(EPERM))
+                return
+            }
             let err = fntfs_link(v, it.inum, dir.inum, nm)
             guard err == 0 else { reply(nil, posixError(-err)); return }
-            _ = bumpGeneration()
+            bumpGeneration(of: dir.inum)
             reply(name, nil)
         } catch {
             reply(nil, error)
@@ -417,9 +460,38 @@ extension NTFSVolume: FSVolume.Operations {
             let it = try requireItem(item)
             let dir = try requireItem(directory)
             let nm = try utf8Name(name)
+
+            // POSIX open-unlink: a file deleted while a process still has it
+            // open must stay readable/writable until the last handle closes.
+            // The bridge decides under its lock whether a ghost is needed
+            // (only when this is the inode's last real name) and parks it in
+            // the root directory; the delete is finalized on the last close
+            // (or reclaim, or the next mount's sweep).
+            itemsLock.lock()
+            let deferDelete = it.isOpen && it.type == .file
+                && it.unlinkedGhost == nil
+            itemsLock.unlock()
+            if deferDelete {
+                var ghost = [CChar](repeating: 0, count: 64)
+                let err = fntfs_unlink_keep(v, dir.inum, nm, it.inum, &ghost)
+                guard err == 0 else { reply(posixError(-err)); return }
+                if ghost[0] != 0 {
+                    itemsLock.lock()
+                    it.unlinkedGhost = String(cString: ghost)
+                    itemsLock.unlock()
+                    // The ghost entry landed in the root directory.
+                    bumpGeneration(of: dir.inum, fntfs_root_inum())
+                } else {
+                    bumpGeneration(of: dir.inum)
+                }
+                reply(nil)
+                return
+            }
+
             let err = fntfs_remove(v, dir.inum, nm, it.inum)
             guard err == 0 else { reply(posixError(-err)); return }
-            _ = bumpGeneration()
+            if it.type == .directory { dropGeneration(of: it.inum) }
+            bumpGeneration(of: dir.inum)
             reply(nil)
         } catch {
             reply(error)
@@ -441,11 +513,38 @@ extension NTFSVolume: FSVolume.Operations {
             // Do NOT delete the destination up front — the bridge replaces it
             // atomically-safely (keeping the old target under a temporary name
             // until the move succeeds) so a failed rename can't lose data.
-            let overInum = try overItem.map { try requireItem($0).inum } ?? 0
-            let err = fntfs_rename(v, it.inum, srcDir.inum, srcName,
-                                   dstDir.inum, dstName, overInum)
+            let overIt = try overItem.map { try requireItem($0) }
+            let overInum = overIt?.inum ?? 0
+
+            // If the replaced destination is still open somewhere, its data
+            // must outlive the rename (same POSIX rule as open-unlink): ask
+            // the bridge to park it instead of deleting it.
+            var keepOver = false
+            if let overIt, overIt.type == .file {
+                itemsLock.lock()
+                keepOver = overIt.isOpen && overIt.unlinkedGhost == nil
+                itemsLock.unlock()
+            }
+
+            var ghost = [CChar](repeating: 0, count: 64)
+            let err = keepOver
+                ? fntfs_rename2(v, it.inum, srcDir.inum, srcName,
+                                dstDir.inum, dstName, overInum, &ghost)
+                : fntfs_rename(v, it.inum, srcDir.inum, srcName,
+                               dstDir.inum, dstName, overInum)
             guard err == 0 else { reply(nil, posixError(-err)); return }
-            _ = bumpGeneration()
+
+            if keepOver, ghost[0] != 0, let overIt {
+                itemsLock.lock()
+                overIt.unlinkedGhost = String(cString: ghost)
+                itemsLock.unlock()
+                // The parked ghost landed in the root directory.
+                bumpGeneration(of: fntfs_root_inum())
+            }
+            if let overIt, overIt.type == .directory {
+                dropGeneration(of: overIt.inum)   // empty dir was replaced
+            }
+            bumpGeneration(of: srcDir.inum, dstDir.inum)
             reply(destinationName, nil)
         } catch {
             reply(nil, error)
@@ -460,6 +559,18 @@ extension NTFSVolume: FSVolume.Operations {
         do {
             let v = try requireVolume()
             let dir = try requireItem(directory)
+
+            // A resumed enumeration (cookie != initial) is only valid against
+            // the directory version it started from: entries added or removed
+            // in between can shift NTFS index positions, so the cookie could
+            // skip or repeat entries. Tell the caller to restart.
+            let currentGen = generation(of: dir.inum)
+            if cookie.rawValue != 0, verifier.rawValue != currentGen {
+                reply(FSDirectoryVerifier(rawValue: 0),
+                      NSError(domain: FSKitErrorDomain,
+                              code: FSError.Code.invalidDirectoryCookie.rawValue))
+                return
+            }
 
             final class EnumCtx {
                 let volume: NTFSVolume
@@ -512,13 +623,46 @@ extension NTFSVolume: FSVolume.Operations {
             let err = fntfs_readdir(v, dir.inum, Int64(cookie.rawValue),
                                     rawCtx, cb)
             guard err == 0 else { reply(FSDirectoryVerifier(rawValue: 0), posixError(-err)); return }
-            itemsLock.lock()
-            let gen = generation
-            itemsLock.unlock()
-            reply(FSDirectoryVerifier(rawValue: gen), nil)
+            reply(FSDirectoryVerifier(rawValue: currentGen), nil)
         } catch {
             reply(FSDirectoryVerifier(rawValue: 0), error)
         }
+    }
+}
+
+// MARK: - Open/Close
+
+// Tracks which items the kernel holds open, so removeItem can tell an
+// open-unlink (defer the real delete) from a plain delete.
+extension NTFSVolume: FSVolume.OpenCloseOperations {
+
+    func openItem(_ item: FSItem, modes: FSVolume.OpenModes,
+                  replyHandler reply: @escaping (Error?) -> Void) {
+        guard let it = item as? NTFSItem else {
+            reply(posixError(EINVAL))
+            return
+        }
+        itemsLock.lock()
+        it.isOpen = true
+        itemsLock.unlock()
+        reply(nil)
+    }
+
+    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes,
+                   replyHandler reply: @escaping (Error?) -> Void) {
+        guard let it = item as? NTFSItem else {
+            reply(posixError(EINVAL))
+            return
+        }
+        // `modes` is the set that remains after this close; empty means the
+        // last handle is gone — finalize a pending open-unlink, if any.
+        if modes.isEmpty {
+            itemsLock.lock()
+            it.isOpen = false
+            itemsLock.unlock()
+            finalizeUnlink(it)
+        }
+        reply(nil)
     }
 }
 

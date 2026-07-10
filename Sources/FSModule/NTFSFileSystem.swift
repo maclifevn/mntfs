@@ -121,20 +121,36 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
         }
         let progress = Progress(totalUnitCount: 100)
         DispatchQueue.global().async {
+            // Honest scope: this inspects the volume's consistency *state*
+            // (dirty flag, hibernation image, unreplayed $LogFile) without
+            // modifying anything. It is not a full chkdsk-style repair.
             let dev = BlockDevice(resource: block)
-            var name = [CChar](repeating: 0, count: 256)
-            var serial: UInt64 = 0
-            let pr = fntfs_probe(dev.opaque, devPread, dev.sizeBytes,
-                                 dev.sectorSize, &name, &serial)
+            var state: UInt32 = 0
+            let rc = fntfs_check_state(dev.opaque, devPread, dev.sizeBytes,
+                                       dev.sectorSize, &state)
             withExtendedLifetime(dev) {}
             progress.completedUnitCount = 100
-            if pr == FNTFS_PROBE_USABLE {
-                task.logMessage("FastNTFS: volume is consistent")
-                task.didComplete(error: nil)
-            } else {
-                task.logMessage("FastNTFS: volume is dirty or unsupported")
-                task.didComplete(error: posixError(EINVAL))
+            guard rc == 0 else {
+                task.logMessage("MNtfs: cannot read the volume as NTFS (errno \(-rc))")
+                task.didComplete(error: posixError(-rc))
+                return
             }
+            if state == 0 {
+                task.logMessage("MNtfs: volume state is clean (note: this checks the dirty flag, hibernation state and journal — it is not a full chkdsk)")
+                task.didComplete(error: nil)
+                return
+            }
+            if state & UInt32(FNTFS_VSTATE_DIRTY) != 0 {
+                task.logMessage("MNtfs: the volume dirty flag is set — Windows did not shut it down cleanly")
+            }
+            if state & UInt32(FNTFS_VSTATE_HIBERNATED) != 0 {
+                task.logMessage("MNtfs: a Windows hibernation / Fast Startup image is present")
+            }
+            if state & UInt32(FNTFS_VSTATE_LOG_DIRTY) != 0 {
+                task.logMessage("MNtfs: the NTFS journal ($LogFile) has unreplayed state")
+            }
+            task.logMessage("MNtfs: run `chkdsk /f` on Windows for a full repair, or let MNtfs mount it read-write to recover the journal and remove the hibernation image")
+            task.didComplete(error: posixError(EBUSY))
         }
         return progress
     }

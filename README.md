@@ -13,8 +13,11 @@ Runs at Full Security on Apple Silicon (developed on macOS 26 / M5).
 
 - Read **and write** NTFS volumes through Apple's official FSKit plumbing.
 - Handles drives left in **Windows Fast Startup / hibernation** — mounts them
-  read/write instead of refusing (it discards the stale fast-boot cache, which
-  is safe; Windows just does a full boot next time).
+  read/write instead of refusing. To make that safe it recovers the NTFS
+  journal and **deletes the hibernation image** (`hiberfil.sys`), exactly like
+  ntfs-3g's `remove_hiberfile` option: Windows loses its fast-boot/hibernation
+  snapshot and performs a clean full boot next time, instead of resuming from
+  stale state onto a changed disk.
 - Runs in the menu bar, starts at login, and **auto-mounts NTFS drives writable
   at boot** — no reopening the app or replugging.
 - Shows drives correctly as *Windows NT File System (NTFS)* in Finder and Disk
