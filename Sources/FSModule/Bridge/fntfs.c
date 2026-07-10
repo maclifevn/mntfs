@@ -39,12 +39,19 @@
  * Ghost names: temporary directory entries the bridge creates for two jobs —
  * parking the target of an overwrite-rename until the move succeeds
  * (".mntfs-mv-…"), and keeping deleted-but-still-open files alive
- * (".mntfs-del-…"). "del" ghosts are invisible to fntfs_readdir; both kinds
- * are swept from the root directory on the next read-write mount, so a crash
- * can't leak them forever.
+ * (".mntfs-del-…"). Both prefixes are a reserved namespace: creating, linking
+ * or renaming user files to them is refused with EINVAL, and only names that
+ * match the exact generated format (with the entry's own MFT number embedded)
+ * are ever treated as ghosts. "del" ghosts are invisible to fntfs_readdir and
+ * are deleted by the sweep at the next read-write mount (their file was
+ * already unlinked; a crash counts as the last close). "mv" ghosts hold live
+ * data, so the sweep never destroys them: a redundant leaked link is removed,
+ * but a ghost that is a file's LAST name (crash mid-rename) is recovered
+ * under a visible "mntfs-recovered-…" name instead.
  */
-#define GHOST_MV_PREFIX  ".mntfs-mv-"
-#define GHOST_DEL_PREFIX ".mntfs-del-"
+#define GHOST_MV_PREFIX   ".mntfs-mv-"
+#define GHOST_DEL_PREFIX  ".mntfs-del-"
+#define GHOST_RECOVER_PREFIX "mntfs-recovered-"
 
 /* ---------------------------------------------------------------- device */
 
@@ -283,6 +290,40 @@ struct fntfs_vol {
 #define LOCK(v)   pthread_mutex_lock(&(v)->lock)
 #define UNLOCK(v) pthread_mutex_unlock(&(v)->lock)
 
+/* Forward declarations (used by the mount-time ghost sweep). */
+static int do_link(fntfs_vol *v, uint64_t inum, uint64_t dir,
+                   const char *name);
+static int count_real_names(fntfs_vol *v, uint64_t inum);
+
+/* Is `name` inside the reserved ghost namespace? User files must never be
+   created there — the readdir filter and mount sweep would eat them. */
+static bool is_reserved_name(const char *name)
+{
+    return !strncmp(name, GHOST_MV_PREFIX, strlen(GHOST_MV_PREFIX)) ||
+           !strncmp(name, GHOST_DEL_PREFIX, strlen(GHOST_DEL_PREFIX));
+}
+
+/*
+ * Does `name` match the exact generated ghost format for `prefix`
+ * ("<prefix><seq-hex>-<inum-hex>") with the embedded inode number equal to
+ * `inum`? Only such names are treated as ghosts by the readdir filter and
+ * the sweep, so a foreign file that merely starts with the prefix (created
+ * on Windows/Linux, or predating the EINVAL guard) is left strictly alone.
+ */
+static bool ghost_name_matches(const char *name, const char *prefix,
+                               uint64_t inum)
+{
+    size_t plen = strlen(prefix);
+    if (strncmp(name, prefix, plen))
+        return false;
+    unsigned long seq;
+    unsigned long long ino;
+    char extra;
+    if (sscanf(name + plen, "%8lx-%llx%c", &seq, &ino, &extra) != 2)
+        return false;
+    return ino == (unsigned long long)inum;
+}
+
 uint64_t fntfs_root_inum(void) { return FILE_root; }
 
 /* --- open-file cache ---------------------------------------------------- */
@@ -432,35 +473,52 @@ static void ghost_name(char *out, size_t cap, const char *prefix,
  * and corrupt everything we changed, so on a read-write mount the image is
  * deleted — the same policy as ntfs-3g's `remove_hiberfile` option. Windows
  * then simply performs a full boot next time.
+ *
+ * Returns 0 only when it is safe to write (no image, invalid image, or the
+ * image was deleted). Any failure — the state can't be determined, or a
+ * confirmed image can't be removed — returns -errno and the caller must
+ * refuse the read-write mount, exactly like upstream ntfs-3g does.
  */
-static void drop_hibernation_image(ntfs_volume *vol)
+static int drop_hibernation_image(ntfs_volume *vol)
 {
     if (!ntfs_volume_check_hiberfile(vol, 0))
-        return;                 /* absent, or no valid image */
+        return 0;               /* absent, or no valid image */
     if (errno != EPERM)
-        return;                 /* unreadable: leave it alone */
+        return -(errno ? errno : EIO);   /* unreadable: state unknown */
+
+    /* A valid hibernation image is confirmed on disk. */
+    int err;
     ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, "hiberfil.sys");
     if (!ni)
-        return;
+        return -(errno ? errno : EIO);
     ntfschar *uname = NULL;
     int ulen = ntfs_mbstoucs("hiberfil.sys", &uname);
     ntfs_inode *root = ntfs_inode_open(vol, FILE_root);
     if (ulen > 0 && root) {
         /* ntfs_delete closes both inodes, success or failure. */
-        if (!ntfs_delete(vol, NULL, ni, root, uname, (u8)ulen))
+        if (!ntfs_delete(vol, NULL, ni, root, uname, (u8)ulen)) {
             ntfs_log_info("MNtfs: removed hibernation image hiberfil.sys\n");
+            err = 0;
+        } else {
+            err = -(errno ? errno : EIO);
+            ntfs_log_error("MNtfs: cannot remove hiberfil.sys (%d); "
+                           "refusing read-write mount\n", -err);
+        }
     } else {
+        err = -(errno ? errno : EIO);
         ntfs_inode_close(ni);
         if (root)
             ntfs_inode_close(root);
     }
     free(uname);
+    return err;
 }
 
 /* Collect leftover ghost entries in the root directory. */
 typedef struct {
     char     names[128][64];
     uint64_t inums[128];
+    uint8_t  is_mv[128];
     int      n;
 } sweep_list;
 
@@ -475,17 +533,30 @@ static int sweep_filldir(void *ctxp, const ntfschar *name, const int name_len,
     char *utf8 = NULL;
     if (ntfs_ucstombs(name, name_len, &utf8, 0) < 0)
         return 0;
-    if (!strncmp(utf8, GHOST_DEL_PREFIX, strlen(GHOST_DEL_PREFIX)) ||
-        !strncmp(utf8, GHOST_MV_PREFIX, strlen(GHOST_MV_PREFIX))) {
+    /* Strict match only: generated format with this entry's own MFT number.
+       Anything else keeps its hands off foreign files. */
+    uint64_t inum = MREF(mref);
+    int is_del = ghost_name_matches(utf8, GHOST_DEL_PREFIX, inum);
+    int is_mv  = !is_del && ghost_name_matches(utf8, GHOST_MV_PREFIX, inum);
+    if (is_del || is_mv) {
         snprintf(sl->names[sl->n], sizeof(sl->names[0]), "%s", utf8);
-        sl->inums[sl->n] = MREF(mref);
+        sl->inums[sl->n] = inum;
+        sl->is_mv[sl->n] = (uint8_t)is_mv;
         sl->n++;
     }
     free(utf8);
     return 0;
 }
 
-/* Delete ghost entries a previous crashed/killed instance left behind. */
+/*
+ * Clean up ghost entries a previous crashed/killed instance left behind.
+ * del-ghosts are files that were already unlinked (the crash was the last
+ * close): delete them. mv-ghosts hold LIVE data from an interrupted rename:
+ * if the inode still has another real name the ghost is just a leaked extra
+ * link and is removed; if the ghost is the inode's last name, deleting it
+ * would destroy the user's file, so it is renamed to a visible
+ * "mntfs-recovered-…" entry instead.
+ */
 static void sweep_ghosts(fntfs_vol *v)
 {
     sweep_list sl = { .n = 0 };
@@ -495,10 +566,29 @@ static void sweep_ghosts(fntfs_vol *v)
     s64 pos = 0;
     ntfs_readdir(root, &pos, &sl, sweep_filldir);
     ntfs_inode_close(root);
-    for (int i = 0; i < sl.n; i++)
-        fntfs_remove(v, FILE_root, sl.names[i], sl.inums[i]);
+    for (int i = 0; i < sl.n; i++) {
+        if (!sl.is_mv[i]) {
+            fntfs_remove(v, FILE_root, sl.names[i], sl.inums[i]);
+            continue;
+        }
+        int names = count_real_names(v, sl.inums[i]);
+        if (names > 1) {
+            /* Redundant leaked link; the file survives under its real name. */
+            fntfs_remove(v, FILE_root, sl.names[i], sl.inums[i]);
+        } else if (names == 1) {
+            char rec[80];
+            snprintf(rec, sizeof rec, "%s%s", GHOST_RECOVER_PREFIX,
+                     sl.names[i] + strlen(GHOST_MV_PREFIX));
+            if (!do_link(v, sl.inums[i], FILE_root, rec)) {
+                fntfs_remove(v, FILE_root, sl.names[i], sl.inums[i]);
+                ntfs_log_error("MNtfs: recovered file stranded by an "
+                               "interrupted rename as '%s'\n", rec);
+            }
+            /* If the link failed, leave the ghost: data stays reachable. */
+        }
+    }
     if (sl.n)
-        ntfs_log_info("MNtfs: swept %d leftover ghost entr%s\n", sl.n,
+        ntfs_log_info("MNtfs: processed %d leftover ghost entr%s\n", sl.n,
                       sl.n == 1 ? "y" : "ies");
 }
 
@@ -601,7 +691,18 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
     ntfs_set_ignore_case(v->vol);
 
     if (!readonly) {
-        drop_hibernation_image(v->vol);
+        /* If a hibernation image is confirmed but can't be removed (or its
+           state can't even be determined), writing is unsafe: refuse the
+           read-write mount — upstream ntfs-3g fails the mount the same way.
+           The system then falls back to a read-only mount. */
+        int herr = drop_hibernation_image(v->vol);
+        if (herr) {
+            *err_out = -herr;
+            ntfs_umount(v->vol, FALSE);     /* also frees the device */
+            pthread_mutex_destroy(&v->lock);
+            free(v);
+            return NULL;
+        }
         sweep_ghosts(v);
     }
     ntfs_volume_get_free_space(v->vol);     /* prime free-cluster count  */
@@ -676,6 +777,14 @@ void fntfs_volname(fntfs_vol *v, char *out)
 }
 
 #ifdef FNTFS_TESTING
+/* Bypass the reserved-namespace guard, to simulate crash-leaked ghosts and
+   foreign files created by other operating systems. */
+int fntfs_test_link_raw(fntfs_vol *v, uint64_t inum, uint64_t dir,
+                        const char *name)
+{
+    return do_link(v, inum, dir, name);
+}
+
 /* White-box access to the sector-alignment layer for the standalone tests. */
 int64_t fntfs_test_pread_aligned(void *ctx, fntfs_pread_cb pr,
                                  uint64_t dev_size, uint32_t sector,
@@ -770,8 +879,9 @@ static int bridge_filldir(void *dirent, const ntfschar *name,
         return 0; /* unconvertible name: skip entry, keep enumerating */
 
     /* Unlink ghosts are deleted files kept alive for still-open handles;
-       they must never appear in a listing. */
-    if (!strncmp(utf8, GHOST_DEL_PREFIX, strlen(GHOST_DEL_PREFIX))) {
+       they must never appear in a listing. Strict format match only, so a
+       foreign file that merely starts with the prefix stays visible. */
+    if (ghost_name_matches(utf8, GHOST_DEL_PREFIX, MREF(mref))) {
         free(utf8);
         return 0;
     }
@@ -874,6 +984,8 @@ static int name_to_ucs(const char *name, ntfschar **uname)
 int fntfs_create(fntfs_vol *v, uint64_t dir, const char *name, bool is_dir,
                  fntfs_attrs *out)
 {
+    if (is_reserved_name(name))
+        return -EINVAL;
     LOCK(v);
     int err = 0;
     ntfschar *uname = NULL;
@@ -941,7 +1053,9 @@ int fntfs_remove(fntfs_vol *v, uint64_t dir, const char *name, uint64_t inum)
     return err;
 }
 
-int fntfs_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
+/* Link without the reserved-namespace guard: internal ghost parking needs to
+   create names inside the reserved prefix space. */
+static int do_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
 {
     LOCK(v);
     int err = fcache_drop(v, inum);
@@ -971,6 +1085,13 @@ int fntfs_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
     free(uname);
     UNLOCK(v);
     return err;
+}
+
+int fntfs_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
+{
+    if (is_reserved_name(name))
+        return -EINVAL;
+    return do_link(v, inum, dir, name);
 }
 
 /* Is `inum` a directory? Uses the cached instance when one exists. */
@@ -1073,18 +1194,18 @@ static int rename_case_change(fntfs_vol *v, uint64_t inum, uint64_t dir,
     char ghost[64];
     ghost_name(ghost, sizeof ghost, GHOST_MV_PREFIX, inum);
 
-    int err = fntfs_link(v, inum, dir, ghost);
+    int err = do_link(v, inum, dir, ghost);
     if (err) return err;
     err = fntfs_remove(v, dir, src_name, inum);
     if (err) {
         fntfs_remove(v, dir, ghost, inum);
         return err;
     }
-    err = fntfs_link(v, inum, dir, dst_name);
+    err = do_link(v, inum, dir, dst_name);
     if (err) {
         /* Put the old name back; worst case the file stays under the ghost
-           name (data preserved, swept/renameable later). */
-        if (!fntfs_link(v, inum, dir, src_name))
+           name (data preserved — the mount sweep recovers root ghosts). */
+        if (!do_link(v, inum, dir, src_name))
             fntfs_remove(v, dir, ghost, inum);
         return err;
     }
@@ -1102,6 +1223,8 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
        NTFS keeps a file's parent in its $FILE_NAME attribute, so link-to-new +
        remove-old correctly re-parents files AND directories (ntfs_link permits
        directory links, which is exactly how ntfs-3g's own rename moves dirs). */
+    if (is_reserved_name(dst_name))
+        return -EINVAL;
     LOCK(v);
     int err;
     if (over_ghost_out)
@@ -1202,7 +1325,7 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
         ghost_dir = dst_dir;
     }
 
-    err = fntfs_link(v, over_inum, ghost_dir, ghost);       /* 1: park target */
+    err = do_link(v, over_inum, ghost_dir, ghost);          /* 1: park target */
     if (err) { UNLOCK(v); return err; }
 
     err = fntfs_remove(v, dst_dir, dst_name, over_inum);    /* 2: free the name */
@@ -1212,7 +1335,7 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
         return err;
     }
 
-    err = fntfs_link(v, inum, dst_dir, dst_name);           /* 3: move source in */
+    err = do_link(v, inum, dst_dir, dst_name);              /* 3: move source in */
     if (err)
         goto restore;
 
@@ -1224,7 +1347,12 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
 
     if (keep_over) {
         /* Success; the replaced inode lives on under the del-ghost until the
-           caller finalizes it (last close / reclaim / mount sweep). */
+           caller finalizes it (last close / reclaim / mount sweep). Hide it
+           from Windows Explorer in case we crash before finalizing. */
+        fntfs_attrs ga;
+        if (!fntfs_getattr(v, over_inum, &ga))
+            fntfs_setwinattrs(v, over_inum, ga.win_attrs |
+                              FNTFS_WINATTR_HIDDEN | FNTFS_WINATTR_SYSTEM);
         snprintf(over_ghost_out, 64, "%s", ghost);
     } else if (fntfs_remove(v, ghost_dir, ghost, over_inum)) {
         /* Success: the old target dies with its last (ghost) name. If this
@@ -1238,8 +1366,9 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
 
 restore:
     /* Put the destination back under its real name; if that also fails the
-       target survives under the ghost name (data preserved, never lost). */
-    if (!fntfs_link(v, over_inum, dst_dir, dst_name))
+       target survives under the ghost name (data preserved, never lost —
+       the mount sweep recovers root ghosts instead of deleting them). */
+    if (!do_link(v, over_inum, dst_dir, dst_name))
         fntfs_remove(v, ghost_dir, ghost, over_inum);
     UNLOCK(v);
     return err;
@@ -1272,14 +1401,22 @@ int fntfs_unlink_keep(fntfs_vol *v, uint64_t dir, const char *name,
     }
 
     ghost_name(ghost_out, 64, GHOST_DEL_PREFIX, inum);
-    int err = fntfs_link(v, inum, FILE_root, ghost_out);
+    int err = do_link(v, inum, FILE_root, ghost_out);
     if (!err) {
         err = fntfs_remove(v, dir, name, inum);
         if (err)
             fntfs_remove(v, FILE_root, ghost_out, inum);    /* roll back */
     }
-    if (err)
+    if (!err) {
+        /* Hide the parked ghost from Windows Explorer in case we crash
+           before finalizing (Explorer doesn't hide dot-names). */
+        fntfs_attrs ga;
+        if (!fntfs_getattr(v, inum, &ga))
+            fntfs_setwinattrs(v, inum, ga.win_attrs |
+                              FNTFS_WINATTR_HIDDEN | FNTFS_WINATTR_SYSTEM);
+    } else {
         ghost_out[0] = '\0';
+    }
     UNLOCK(v);
     return err;
 }

@@ -56,6 +56,8 @@ static int64_t cb_pwrite(void *ctx, const void *buf, int64_t count,
 }
 
 /* White-box hooks from fntfs.c (compiled with -DFNTFS_TESTING). */
+extern int fntfs_test_link_raw(fntfs_vol *v, uint64_t inum, uint64_t dir,
+                               const char *name);
 extern int64_t fntfs_test_pread_aligned(void *ctx, fntfs_pread_cb pr,
                                         uint64_t dev_size, uint32_t sector,
                                         void *buf, int64_t count, int64_t off);
@@ -391,7 +393,55 @@ int main(int argc, char **argv)
     CHECK(fntfs_remove(v, root, kghost, rd.inum) == 0, "finalize kept over");
     CHECK(fntfs_remove(v, root, "cur.cfg", rs.inum) == 0, "rm cur.cfg");
 
-    /* leave one ghost behind on purpose: the next rw mount must sweep it */
+    /* --- reserved ghost namespace is rejected for user names --- */
+    fntfs_attrs rsv;
+    CHECK(fntfs_create(v, root, ".mntfs-del-userfile", false, &rsv) == -EINVAL,
+          "create in del namespace rejected");
+    CHECK(fntfs_create(v, root, ".mntfs-mv-userfile", false, &rsv) == -EINVAL,
+          "create in mv namespace rejected");
+    fntfs_attrs anyf;
+    CHECK(fntfs_create(v, root, "any.txt", false, &anyf) == 0, "create any");
+    CHECK(fntfs_link(v, anyf.inum, root, ".mntfs-del-alias") == -EINVAL,
+          "link into ghost namespace rejected");
+    CHECK(fntfs_rename(v, anyf.inum, root, "any.txt",
+                       root, ".mntfs-mv-evil", 0) == -EINVAL,
+          "rename into ghost namespace rejected");
+
+    /* a FOREIGN file that merely starts with the prefix (e.g. created on
+       Windows) must stay visible and must survive the mount sweep */
+    CHECK(fntfs_test_link_raw(v, anyf.inum, root, ".mntfs-del-hello") == 0,
+          "raw link foreign-style name");
+    CHECK(fntfs_remove(v, root, "any.txt", anyf.inum) == 0, "drop real name");
+    struct entlist elf = {0};
+    CHECK(fntfs_readdir(v, root, 0, &elf, collect_cb) == 0, "readdir foreign");
+    CHECK(list_has(&elf, ".mntfs-del-hello") >= 0,
+          "foreign prefix-named file stays visible");
+
+    /* --- crashed rename simulation: mv-ghost as the file's LAST name must
+           be RECOVERED by the sweep, never deleted --- */
+    fntfs_attrs strand;
+    CHECK(fntfs_create(v, root, "victim2.txt", false, &strand) == 0,
+          "create victim2");
+    CHECK(fntfs_write(v, strand.inum, "PRECIOUS", 8, 0) == 8, "write victim2");
+    char mvghost[64];
+    snprintf(mvghost, sizeof mvghost, ".mntfs-mv-%08lx-%llx", 1ul,
+             (unsigned long long)strand.inum);
+    CHECK(fntfs_test_link_raw(v, strand.inum, root, mvghost) == 0,
+          "raw link mv ghost");
+    CHECK(fntfs_remove(v, root, "victim2.txt", strand.inum) == 0,
+          "drop victim2 real name (simulate crash mid-rename)");
+
+    /* redundant mv-ghost (extra leaked link): sweep may safely remove it */
+    fntfs_attrs redun;
+    CHECK(fntfs_create(v, root, "stays.txt", false, &redun) == 0,
+          "create stays");
+    char mvghost2[64];
+    snprintf(mvghost2, sizeof mvghost2, ".mntfs-mv-%08lx-%llx", 2ul,
+             (unsigned long long)redun.inum);
+    CHECK(fntfs_test_link_raw(v, redun.inum, root, mvghost2) == 0,
+          "raw link redundant mv ghost");
+
+    /* leave one del-ghost behind on purpose: the next rw mount sweeps it */
     fntfs_attrs ou2;
     CHECK(fntfs_create(v, root, "crashfile.txt", false, &ou2) == 0,
           "create crashfile");
@@ -399,6 +449,8 @@ int main(int argc, char **argv)
     CHECK(fntfs_unlink_keep(v, root, "crashfile.txt", ou2.inum, ghost2) == 0,
           "unlink_keep crashfile");
     CHECK(ghost2[0] != '\0', "crashfile parked under a ghost");
+    CHECK(fntfs_getattr(v, ou2.inum, &a) == 0 &&
+          (a.win_attrs & FNTFS_WINATTR_HIDDEN), "parked ghost is hidden");
     printf("open-unlink semantics ok\n");
 
     /* --- hard link --- */
@@ -452,9 +504,27 @@ int main(int argc, char **argv)
           "persisted size");
     /* the ghost left by the "crashed" unlink_keep must have been swept */
     CHECK(fntfs_lookup(v, root, ghost2, &la) == -ENOENT,
-          "leftover ghost swept at remount");
+          "leftover del ghost swept at remount");
+    /* the stranded mv-ghost was RECOVERED, not deleted */
+    CHECK(fntfs_lookup(v, root, mvghost, &la) == -ENOENT,
+          "stranded mv ghost gone");
+    char recname[80];
+    snprintf(recname, sizeof recname, "mntfs-recovered-%s",
+             mvghost + strlen(".mntfs-mv-"));
+    CHECK(fntfs_lookup(v, root, recname, &la) == 0 && la.inum == strand.inum,
+          "stranded file recovered under visible name");
+    r = fntfs_read(v, strand.inum, rbuf, 8, 0);
+    CHECK(r == 8 && !memcmp(rbuf, "PRECIOUS", 8), "recovered data intact");
+    /* the redundant mv-ghost was removed, its real name survives */
+    CHECK(fntfs_lookup(v, root, mvghost2, &la) == -ENOENT,
+          "redundant mv ghost removed");
+    CHECK(fntfs_lookup(v, root, "stays.txt", &la) == 0 && la.inum == redun.inum,
+          "real name of redundant-ghost file intact");
+    /* the foreign prefix-named file survived the sweep untouched */
+    CHECK(fntfs_lookup(v, root, ".mntfs-del-hello", &la) == 0 &&
+          la.inum == anyf.inum, "foreign prefix-named file survived sweep");
     CHECK(fntfs_unmount(v) == 0, "unmount 2");
-    printf("ghost sweep ok\n");
+    printf("ghost sweep ok (del swept, stranded recovered, foreign kept)\n");
 
     /* --- consistency check on the (clean) unmounted image --- */
     uint32_t vstate = 0xffffffffu;
