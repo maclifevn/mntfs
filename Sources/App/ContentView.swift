@@ -330,23 +330,33 @@ final class VolumeStore: ObservableObject {
         }
     }
 
+    /// Thread-safe snapshot of the mount table. Never use `getmntinfo` here:
+    /// it reuses ONE static buffer per process and reallocs it on every call,
+    /// so two threads calling it at once corrupt the heap — that crashed the
+    /// app whenever plugging a drive fired refresh + auto-remount + extension
+    /// checks concurrently. `getmntinfo_r_np` gives each caller its own copy.
+    nonisolated private static func mountTable() -> [statfs] {
+        var buf: UnsafeMutablePointer<statfs>? = nil
+        let n = getmntinfo_r_np(&buf, MNT_NOWAIT)
+        guard n > 0, let list = buf else { return [] }
+        defer { free(list) }
+        return Array(UnsafeBufferPointer(start: list, count: Int(n)))
+    }
+
+    nonisolated private static func cStr16<T>(_ field: T) -> String {
+        withUnsafeBytes(of: field) {
+            String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+    }
+
     /// Remount every volume our driver has mounted ("mntfs"), so Finder and
     /// Disk Utility re-read the (now installed) display name. Best-effort:
     /// a busy volume that won't unmount is simply left as-is.
     nonisolated private static func remountNTFSVolumes() {
-        var buf: UnsafeMutablePointer<statfs>?
-        let n = getmntinfo(&buf, MNT_NOWAIT)
-        guard n > 0, let buf else { return }
         var devs: [String] = []
-        for i in 0..<Int(n) {
-            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
-                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            guard t == "mntfs" else { continue }
-            let dev = withUnsafeBytes(of: buf[i].f_mntfromname) {
-                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            devs.append(dev)
+        for fs in mountTable() {
+            guard cStr16(fs.f_fstypename) == "mntfs" else { continue }
+            devs.append(cStr16(fs.f_mntfromname))
         }
         for dev in devs {
             // Plain (non-force) unmount: it fails if the volume is busy, so an
@@ -439,14 +449,9 @@ final class VolumeStore: ObservableObject {
     /// mounts NTFS writable (Apple's built-in handler is read-only), so a
     /// writable "ntfs" mount is a definitive sign the extension is working now.
     nonisolated static func hasMntfsMount() -> Bool {
-        var buf: UnsafeMutablePointer<statfs>?
-        let n = getmntinfo(&buf, MNT_NOWAIT)
-        guard n > 0, let buf else { return false }
-        for i in 0..<Int(n) {
-            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
-                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            let readOnly = (buf[i].f_flags & UInt32(MNT_RDONLY)) != 0
+        for fs in mountTable() {
+            let t = cStr16(fs.f_fstypename)
+            let readOnly = (fs.f_flags & UInt32(MNT_RDONLY)) != 0
             if (t == "ntfs" || t == "mntfs") && !readOnly { return true }
         }
         return false
@@ -508,20 +513,11 @@ final class VolumeStore: ObservableObject {
     /// built-in handler (fstype "ntfs"). Our driver uses "mntfs", so these are
     /// exactly the ones we want to take over.
     nonisolated private static func readOnlyAppleNTFSDevices() -> [String] {
-        var buf: UnsafeMutablePointer<statfs>?
-        let n = getmntinfo(&buf, MNT_NOWAIT)
-        guard n > 0, let buf else { return [] }
         var out: [String] = []
-        for i in 0..<Int(n) {
-            let t = withUnsafeBytes(of: buf[i].f_fstypename) {
-                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            let readOnly = (buf[i].f_flags & UInt32(MNT_RDONLY)) != 0
-            guard t == "ntfs", readOnly else { continue }
-            let dev = withUnsafeBytes(of: buf[i].f_mntfromname) {
-                String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            out.append(dev)
+        for fs in mountTable() {
+            let readOnly = (fs.f_flags & UInt32(MNT_RDONLY)) != 0
+            guard cStr16(fs.f_fstypename) == "ntfs", readOnly else { continue }
+            out.append(cStr16(fs.f_mntfromname))
         }
         return out
     }
