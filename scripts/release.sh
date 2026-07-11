@@ -46,13 +46,11 @@ xcrun notarytool submit /tmp/MNtfs-app.zip \
     --key "$KEY" --key-id "$KID" --issuer "$ISS" --wait
 xcrun stapler staple "$APP"
 
-echo "==> 4/6  Build DMG"
-rm -rf /tmp/dmg-final; mkdir -p /tmp/dmg-final
-cp -R "$APP" /tmp/dmg-final/
-ln -s /Applications /tmp/dmg-final/Applications
-cp dist/README-dmg.txt "/tmp/dmg-final/Đọc trước.txt" 2>/dev/null || true
-mkdir -p dist; rm -f "$DMG"
-hdiutil create -volname "MNtfs" -srcfolder /tmp/dmg-final -ov -format UDZO "$DMG"
+echo "==> 4/6  Build DMG (drag-to-Applications, custom background)"
+# Staple the app first so it launches offline on a fresh Mac (the ticket
+# was issued when notarization Accepted in step 3).
+xcrun stapler staple "$APP"
+sh scripts/make-dmg.sh "$APP" "$DMG" dmg/background.tiff "MNtfs $VERSION-arm64"
 
 echo "==> 5/6  Notarize + staple the DMG"
 xcrun notarytool submit "$DMG" --key "$KEY" --key-id "$KID" --issuer "$ISS" --wait
