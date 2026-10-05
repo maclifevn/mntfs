@@ -25,10 +25,15 @@ struct MNtfsApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let store = VolumeStore()
+    lazy var updater = UpdateController(safety: UpdateSafetyGate(
+        pause: { [store] in store.updatePreparationInProgress = true },
+        resume: { [store] in store.updatePreparationInProgress = false },
+        snapshot: { [store] in store.updateSafetySnapshot() }))
     private var window: NSWindow?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+        updater.start()
         let d = UserDefaults.standard
         if !d.bool(forKey: "didFirstRun") {
             d.set(true, forKey: "didFirstRun")
@@ -45,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // Keep running in the background when the window is closed.
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        updater.applicationShouldTerminate()
+    }
 
     // Re-opening the app from Finder/Dock (while it runs in the background) shows the window.
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
@@ -84,7 +93,25 @@ struct MenuBarContent: View {
         Toggle("Open at Login", isOn: $loginOn)
             .onChange(of: loginOn) { _, on in LoginItem.setEnabled(on) }
         Divider()
+        UpdateMenu(updater: delegate.updater)
+        Divider()
         Button("Quit MNtfs") { NSApp.terminate(nil) }
+    }
+}
+
+private struct UpdateMenu: View {
+    @ObservedObject var updater: UpdateController
+
+    var body: some View {
+        Button(updater.installationPending ? "Install Downloaded Update…"
+               : updater.availableVersion.map { "Update to \($0)…" } ?? "Check for Updates…") {
+            updater.checkForUpdates()
+        }
+        .disabled(!updater.canCheckForUpdates)
+        Toggle("Automatically Check for Updates", isOn: Binding(
+            get: { updater.automaticallyChecksForUpdates },
+            set: { updater.setAutomaticChecks($0) }))
+        .disabled(!updater.canCheckForUpdates)
     }
 }
 

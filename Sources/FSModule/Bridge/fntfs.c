@@ -55,6 +55,23 @@
 
 /* ---------------------------------------------------------------- device */
 
+/* libntfs-3g repeatedly reads the allocation bitmap and MFT during a copy.
+   Each direct FSKit access has device/IPC latency. Cache only small reads;
+   large file I/O bypasses this cache. Writes remain synchronous, invalidate
+   every overlapping entry BEFORE I/O, and seed the cache only on full success.
+   There is no dirty data here to lose on an eviction or a failed write. */
+enum { SMALL_IO_SIZE = 16 << 10, SMALL_IO_SLOTS = 16 };
+typedef struct {
+    int64_t offset, length;             /* length == 0: empty */
+    uint64_t stamp;
+    char data[SMALL_IO_SIZE];
+} small_io_entry;
+
+typedef struct {
+    uint64_t clock;
+    small_io_entry entries[SMALL_IO_SLOTS];
+} small_io_cache;
+
 typedef struct {
     void           *swift_ctx;
     fntfs_pread_cb  pread_cb;
@@ -64,12 +81,74 @@ typedef struct {
     uint32_t        sector;    /* alignment unit      */
     int64_t         pos;       /* for seek/read/write */
     bool            readonly;
+    small_io_cache *read_cache; /* optional, protected by the volume lock */
 } fntfs_dev_ctx;
+
+static void small_io_store(small_io_cache *cache, const void *buf,
+                            int64_t count, int64_t offset)
+{
+    if (!cache || count <= 0 || count > SMALL_IO_SIZE) return;
+    int victim = 0;
+    for (int i = 0; i < SMALL_IO_SLOTS; i++) {
+        small_io_entry *e = &cache->entries[i];
+        if (!e->length || (e->offset == offset && e->length == count)) {
+            victim = i;
+            break;
+        }
+        if (e->stamp < cache->entries[victim].stamp) victim = i;
+    }
+    small_io_entry *e = &cache->entries[victim];
+    memcpy(e->data, buf, (size_t)count);
+    e->offset = offset;
+    e->length = count;
+    e->stamp = ++cache->clock;
+}
+
+static int64_t device_read(fntfs_dev_ctx *c, void *buf, int64_t count,
+                            int64_t offset)
+{
+    if (c->read_cache && count <= SMALL_IO_SIZE) {
+        for (int i = 0; i < SMALL_IO_SLOTS; i++) {
+            small_io_entry *e = &c->read_cache->entries[i];
+            if (e->length == count && e->offset == offset) {
+                memcpy(buf, e->data, (size_t)count);
+                e->stamp = ++c->read_cache->clock;
+                return count;
+            }
+        }
+    }
+    int64_t r = c->pread_cb(c->swift_ctx, buf, count, offset);
+    if (r == count) small_io_store(c->read_cache, buf, count, offset);
+    return r;
+}
+
+static int64_t device_write(fntfs_dev_ctx *c, const void *buf, int64_t count,
+                             int64_t offset)
+{
+    if (c->read_cache) {
+        for (int i = 0; i < SMALL_IO_SLOTS; i++) {
+            small_io_entry *e = &c->read_cache->entries[i];
+            if (e->length && offset < e->offset + e->length &&
+                e->offset < offset + count)
+                e->length = 0;
+        }
+    }
+    int64_t w = c->pwrite_cb(c->swift_ctx, buf, count, offset);
+    if (w == count) small_io_store(c->read_cache, buf, count, offset);
+    return w;
+}
 
 /* Cap on any single bounce allocation used for unaligned I/O. A multiple of
    both common sector sizes (512, 4096); large unaligned requests are processed
    in chunks of this size instead of one giant malloc. */
 enum { BOUNCE_CHUNK = 1 << 20 };   /* 1 MiB */
+
+static bool valid_geometry(uint64_t size, uint32_t sector)
+{
+    return sector >= 512 && sector <= BOUNCE_CHUNK &&
+        (sector & (sector - 1)) == 0 && size >= sector &&
+        size <= INT64_MAX && size % sector == 0;
+}
 
 static int64_t dev_pread_aligned(fntfs_dev_ctx *c, void *buf, int64_t count,
                                  int64_t offset)
@@ -81,7 +160,7 @@ static int64_t dev_pread_aligned(fntfs_dev_ctx *c, void *buf, int64_t count,
 
     const uint32_t ss = c->sector;
     if ((offset % ss) == 0 && (count % ss) == 0)
-        return c->pread_cb(c->swift_ctx, buf, count, offset);
+        return device_read(c, buf, count, offset);
 
     /* Unaligned: bounce through a size-capped aligned buffer, chunk by chunk.
        The aligned span covers only the remaining request (rounded to sectors),
@@ -95,7 +174,7 @@ static int64_t dev_pread_aligned(fntfs_dev_ctx *c, void *buf, int64_t count,
         int64_t alen = ((o - astart) + (count - done) + ss - 1) / ss * ss;
         if (alen > BOUNCE_CHUNK) alen = BOUNCE_CHUNK;    /* ss divides 1 MiB */
         if (astart + alen > c->size) alen = c->size - astart;
-        int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
+        int64_t r = device_read(c, tmp, alen, astart);
         if (r < 0) { free(tmp); return done ? done : r; }
         int64_t skip = o - astart;                       /* 0 .. ss-1 */
         int64_t avail = r - skip;
@@ -120,28 +199,53 @@ static int64_t dev_pwrite_aligned(fntfs_dev_ctx *c, const void *buf,
 
     const uint32_t ss = c->sector;
     if ((offset % ss) == 0 && (count % ss) == 0)
-        return c->pwrite_cb(c->swift_ctx, buf, count, offset);
+        return device_write(c, buf, count, offset);
 
-    /* Unaligned: read-modify-write the aligned span that covers the remaining
-       request (capped at BOUNCE_CHUNK per pass), so a tiny unaligned write
-       costs one sector of read-modify-write, not a whole chunk. */
-    char *tmp = malloc(BOUNCE_CHUNK);
+    /* Keep small metadata updates in one device write. Splitting a bitmap
+       update into head/body/tail increases IPC and invalidates the whole
+       cached bitmap read. Its exact aligned span can be read from our cache. */
+    if (count <= SMALL_IO_SIZE) {
+        int64_t astart = offset / ss * ss;
+        int64_t skip = offset - astart;
+        int64_t alen = (skip + count + ss - 1) / ss * ss;
+        if (alen <= SMALL_IO_SIZE) {
+            char *tmp = malloc((size_t)alen);
+            if (!tmp) return -ENOMEM;
+            int64_t r = device_read(c, tmp, alen, astart);
+            if (r < alen) { free(tmp); return r < 0 ? r : -EIO; }
+            memcpy(tmp + skip, buf, (size_t)count);
+            int64_t w = device_write(c, tmp, alen, astart);
+            free(tmp);
+            return w == alen ? count : (w < 0 ? w : -EIO);
+        }
+    }
+
+    /* Only partial edge sectors require read-modify-write. Send complete
+       sectors directly: reading the entire span first doubles device traffic
+       for a large write with an odd offset or length. */
+    char *tmp = malloc(ss);
     if (!tmp) return -ENOMEM;
     int64_t done = 0;
     while (done < count) {
         int64_t o = offset + done;
-        int64_t astart = (o / ss) * ss;
-        int64_t alen = ((o - astart) + (count - done) + ss - 1) / ss * ss;
-        if (alen > BOUNCE_CHUNK) alen = BOUNCE_CHUNK;    /* ss divides 1 MiB */
-        if (astart + alen > c->size) alen = c->size - astart;
-        int64_t skip = o - astart;
+        int64_t skip = o % ss;
         int64_t chunk = count - done;
-        if (chunk > alen - skip) chunk = alen - skip;
-        int64_t r = c->pread_cb(c->swift_ctx, tmp, alen, astart);
-        if (r < alen) { free(tmp); return done ? done : (r < 0 ? r : -EIO); }
+        if (!skip && chunk >= ss) {
+            chunk = chunk / ss * ss;
+            if (chunk > BOUNCE_CHUNK) chunk = BOUNCE_CHUNK;
+            int64_t w = device_write(c, (const char *)buf + done, chunk, o);
+            if (w <= 0) { free(tmp); return done ? done : (w < 0 ? w : -EIO); }
+            done += w;
+            if (w < chunk) { free(tmp); return done; }
+            continue;
+        }
+        int64_t astart = o - skip;
+        if (chunk > ss - skip) chunk = ss - skip;
+        int64_t r = device_read(c, tmp, ss, astart);
+        if (r < ss) { free(tmp); return done ? done : (r < 0 ? r : -EIO); }
         memcpy(tmp + skip, (const char *)buf + done, (size_t)chunk);
-        int64_t w = c->pwrite_cb(c->swift_ctx, tmp, alen, astart);
-        if (w < alen) { free(tmp); return done ? done : (w < 0 ? w : -EIO); }
+        int64_t w = device_write(c, tmp, ss, astart);
+        if (w < ss) { free(tmp); return done ? done : (w < 0 ? w : -EIO); }
         done += chunk;
     }
     free(tmp);
@@ -421,10 +525,11 @@ static ntfs_inode *inode_get(fntfs_vol *v, uint64_t inum, bool *cached)
     return ntfs_inode_open(v->vol, MK_MREF(inum, 0));
 }
 
-static void inode_put(ntfs_inode *ni, bool cached)
+static int inode_put(ntfs_inode *ni, bool cached)
 {
-    if (!cached && ni)
-        ntfs_inode_close(ni);
+    if (!cached && ni && ntfs_inode_close(ni))
+        return -(errno ? errno : EIO);
+    return 0;
 }
 
 /* --- attrs --------------------------------------------------------------- */
@@ -615,6 +720,9 @@ int fntfs_probe(void *ctx, fntfs_pread_cb pread_cb, uint64_t dev_size,
 {
     name_out[0] = '\0';
     *serial_out = 0;
+    if (!sector_size) sector_size = 512;
+    if (!valid_geometry(dev_size, sector_size))
+        return FNTFS_PROBE_UNRECOGNIZED;
 
     if (!boot_sector_is_ntfs(ctx, pread_cb, sector_size, serial_out))
         return FNTFS_PROBE_UNRECOGNIZED;
@@ -635,6 +743,8 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
                        char *name_out, uint64_t *serial_out, int *err_out)
 {
     *err_out = 0;
+    if (!sector_size) sector_size = 512;
+    if (!valid_geometry(dev_size, sector_size)) { *err_out = EINVAL; return NULL; }
     if (!readonly && !pwrite_cb) { *err_out = EINVAL; return NULL; }
 
     fntfs_vol *v = calloc(1, sizeof(*v));
@@ -682,6 +792,10 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
         return NULL;
     }
 
+    /* Optional optimization: allocation failure leaves uncached I/O working.
+       Each mount owns its cache, so remounts never reuse stale device data. */
+    v->devctx.read_cache = calloc(1, sizeof(small_io_cache));
+
     NVolSetShowHidFiles(v->vol);            /* surface hidden files      */
     NVolClearShowSysFiles(v->vol);          /* hide $MFT & co. (default on!) */
 
@@ -699,6 +813,7 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
         if (herr) {
             *err_out = -herr;
             ntfs_umount(v->vol, FALSE);     /* also frees the device */
+            free(v->devctx.read_cache);
             pthread_mutex_destroy(&v->lock);
             free(v);
             return NULL;
@@ -727,6 +842,14 @@ static int sync_all_locked(fntfs_vol *v)
     for (int i = 0; i < FCACHE_SIZE; i++)
         if (v->cache[i].inum && ntfs_inode_sync(v->cache[i].ni) && !err)
             err = -errno;
+    /* libntfs-3g keeps these metadata inodes open outside our file cache.
+       In particular, allocation can dirty $MFT/$Bitmap without dirtying a
+       cached regular file. Flush them before the device's sync callback. */
+    ntfs_inode *metadata[] = { v->vol->vol_ni, v->vol->lcnbmp_ni,
+        v->vol->mft_ni, v->vol->mftmirr_ni, v->vol->secure_ni };
+    for (size_t i = 0; i < sizeof(metadata) / sizeof(metadata[0]); i++)
+        if (metadata[i] && ntfs_inode_sync(metadata[i]) && !err)
+            err = -(errno ? errno : EIO);
     if (v->dev->d_ops->sync(v->dev) && !err)
         err = -errno;
     return err;
@@ -749,6 +872,7 @@ int fntfs_unmount(fntfs_vol *v)
     v->vol = NULL;
     UNLOCK(v);
     pthread_mutex_destroy(&v->lock);
+    free(v->devctx.read_cache);
     free(v);
     return err;
 }
@@ -777,6 +901,18 @@ void fntfs_volname(fntfs_vol *v, char *out)
 }
 
 #ifdef FNTFS_TESTING
+/* Simulate dirty metadata outside the regular-file cache. */
+void fntfs_test_dirty_metadata(fntfs_vol *v)
+{
+    ntfs_inode_mark_dirty(v->vol->mft_ni);
+    ntfs_inode_mark_dirty(v->vol->lcnbmp_ni);
+}
+
+bool fntfs_test_metadata_is_dirty(fntfs_vol *v)
+{
+    return NInoDirty(v->vol->mft_ni) || NInoDirty(v->vol->lcnbmp_ni);
+}
+
 /* Bypass the reserved-namespace guard, to simulate crash-leaked ghosts and
    foreign files created by other operating systems. */
 int fntfs_test_link_raw(fntfs_vol *v, uint64_t inum, uint64_t dir,
@@ -1431,13 +1567,12 @@ int fntfs_settimes(fntfs_vol *v, uint64_t inum, const fntfs_attrs *times,
     ntfs_inode *ni = inode_get(v, inum, &cached);
     if (!ni) { int e = -errno; UNLOCK(v); return e; }
 
-    /* ntfs_inode_set_times takes packed little-endian NTFS times:
-       [creation, last data change, last MFT change, last access]. */
-    u64 packed[4];
+    /* Upstream ntfs_inode_set_times consumes exactly three timestamps:
+       [creation, last data change, last access]. It sets MFT change to now. */
+    u64 packed[3];
     packed[0] = (u64)ni->creation_time;
     packed[1] = (u64)ni->last_data_change_time;
-    packed[2] = (u64)ni->last_mft_change_time;
-    packed[3] = (u64)ni->last_access_time;
+    packed[2] = (u64)ni->last_access_time;
 
     struct timespec ts;
     if (mask & FNTFS_SET_CRTIME) {
@@ -1450,13 +1585,14 @@ int fntfs_settimes(fntfs_vol *v, uint64_t inum, const fntfs_attrs *times,
     }
     if (mask & FNTFS_SET_ATIME) {
         ts.tv_sec = times->atime_sec; ts.tv_nsec = times->atime_nsec;
-        packed[3] = (u64)timespec2ntfs(ts);
+        packed[2] = (u64)timespec2ntfs(ts);
     }
 
     int err = 0;
     if (ntfs_inode_set_times(ni, (const char *)packed, sizeof(packed), 0))
         err = -errno;
-    inode_put(ni, cached);
+    int close_err = inode_put(ni, cached);
+    if (!err) err = close_err;
     UNLOCK(v);
     return err;
 }

@@ -16,6 +16,9 @@ Sources/App/Resources/mkntfs
 *.p8
 dist/*.dmg
 MNtfs-app.zip
+dist/*.zip
+dist/updates/
+dist/test/
 dist/MNtfs.app/
 signing/*.bak-*
 

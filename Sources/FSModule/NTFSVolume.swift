@@ -29,10 +29,6 @@ final class NTFSVolume: FSVolume {
     /// may no longer be valid. Starts at 1 (0 is the "initial" verifier).
     private var dirGeneration: [UInt64: UInt64] = [:]
 
-    // Ownerless volume: expose everything to the mounting user.
-    private let uid: UInt32 = 99  // unknown
-    private let gid: UInt32 = 99
-
     init(device: BlockDevice, readOnly: Bool, vol: OpaquePointer,
          name: String, serial: UInt64) {
         self.device = device
@@ -124,14 +120,21 @@ final class NTFSVolume: FSVolume {
         }
     }
 
-    private func fsAttributes(_ a: fntfs_attrs) -> FSItem.Attributes {
+    /// FSKit reserves ID 2 for the root. Keep raw MFT numbers in the bridge,
+    /// and translate consistently at both attribute and enumeration boundaries.
+    static func itemID(for inum: UInt64) -> FSItem.Identifier {
+        inum == fntfs_root_inum() ? .rootDirectory
+            : FSItem.Identifier(rawValue: inum) ?? .invalid
+    }
+
+    static func fsAttributes(_ a: fntfs_attrs) -> FSItem.Attributes {
         let out = FSItem.Attributes()
         out.invalidateAllProperties()
         let type = Self.itemType(a.type)
         out.type = type
-        out.fileID = FSItem.Identifier(rawValue: a.inum) ?? .invalid
-        out.uid = uid
-        out.gid = gid
+        out.fileID = itemID(for: a.inum)
+        out.uid = 99  // unknown; ownerless volume
+        out.gid = 99
         out.linkCount = a.nlink
 
         var mode: UInt32 = (type == .directory) ? 0o777 : 0o666
@@ -141,7 +144,11 @@ final class NTFSVolume: FSVolume {
         out.mode = mode
 
         var flags: UInt32 = 0
-        if a.win_attrs & UInt32(FNTFS_WINATTR_HIDDEN) != 0 {
+        // NTFS marks its root as hidden/system on Windows. Mapping that to
+        // UF_HIDDEN hides the entire mounted drive in Finder and on Desktop.
+        // Preserve hidden semantics for children without changing disk flags.
+        if a.inum != fntfs_root_inum(),
+           a.win_attrs & UInt32(FNTFS_WINATTR_HIDDEN) != 0 {
             flags |= UInt32(UF_HIDDEN)
         }
         out.flags = flags
@@ -284,7 +291,7 @@ extension NTFSVolume: FSVolume.Operations {
             var a = fntfs_attrs()
             let err = fntfs_getattr(v, it.inum, &a)
             guard err == 0 else { reply(nil, posixError(-err)); return }
-            reply(fsAttributes(a), nil)
+            reply(Self.fsAttributes(a), nil)
         } catch {
             reply(nil, error)
         }
@@ -302,7 +309,7 @@ extension NTFSVolume: FSVolume.Operations {
             var a = fntfs_attrs()
             let err = fntfs_getattr(v, it.inum, &a)
             guard err == 0 else { reply(nil, posixError(-err)); return }
-            reply(fsAttributes(a), nil)
+            reply(Self.fsAttributes(a), nil)
         } catch {
             reply(nil, error)
         }
@@ -605,14 +612,14 @@ extension NTFSVolume: FSVolume.Operations {
                         return true  // entry vanished or unreadable: skip
                     }
                     _ = req
-                    attrs = ctx.volume.fsAttributes(a)
+                    attrs = NTFSVolume.fsAttributes(a)
                 }
                 let type: FSItem.ItemType =
                     (Int(ctype) == FNTFS_TYPE_DIR) ? .directory : .file
                 let ok = ctx.packer.packEntry(
                     name: FSFileName(string: name),
                     itemType: type,
-                    itemID: FSItem.Identifier(rawValue: inum) ?? .invalid,
+                    itemID: NTFSVolume.itemID(for: inum),
                     nextCookie: FSDirectoryCookie(rawValue: UInt64(nextCookie)),
                     attributes: attrs)
                 if ok { ctx.packedCount += 1 }

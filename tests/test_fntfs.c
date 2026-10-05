@@ -18,7 +18,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef SECTOR
 #define SECTOR 512
+#endif
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
@@ -31,6 +33,8 @@
 
 static int g_fd;
 static int64_t g_max_io;   /* largest single device I/O since last reset */
+static int g_fail_writes;
+static bool g_fail_flush;
 
 static int64_t cb_pread(void *ctx, void *buf, int64_t count, int64_t offset)
 {
@@ -51,6 +55,7 @@ static int64_t cb_pwrite(void *ctx, const void *buf, int64_t count,
           "unaligned pwrite off=%lld len=%lld", (long long)offset,
           (long long)count);
     if (count > g_max_io) g_max_io = count;
+    if (g_fail_writes) { g_fail_writes--; return -EIO; }
     ssize_t r = pwrite(g_fd, buf, (size_t)count, offset);
     return r < 0 ? -errno : r;
 }
@@ -58,6 +63,8 @@ static int64_t cb_pwrite(void *ctx, const void *buf, int64_t count,
 /* White-box hooks from fntfs.c (compiled with -DFNTFS_TESTING). */
 extern int fntfs_test_link_raw(fntfs_vol *v, uint64_t inum, uint64_t dir,
                                const char *name);
+extern void fntfs_test_dirty_metadata(fntfs_vol *v);
+extern bool fntfs_test_metadata_is_dirty(fntfs_vol *v);
 extern int64_t fntfs_test_pread_aligned(void *ctx, fntfs_pread_cb pr,
                                         uint64_t dev_size, uint32_t sector,
                                         void *buf, int64_t count, int64_t off);
@@ -69,6 +76,7 @@ extern int64_t fntfs_test_pwrite_aligned(void *ctx, fntfs_pread_cb pr,
 static int cb_flush(void *ctx)
 {
     (void)ctx;
+    if (g_fail_flush) return -EIO;
     return fsync(g_fd) < 0 ? -errno : 0;
 }
 
@@ -147,6 +155,16 @@ int main(int argc, char **argv)
     fntfs_attrs a;
     CHECK(fntfs_getattr(v, root, &a) == 0, "getattr root");
     CHECK(a.type == FNTFS_TYPE_DIR, "root type");
+
+    /* Sync must include the metadata inodes owned by libntfs-3g, and must
+       report a device flush failure rather than claiming success. */
+    fntfs_test_dirty_metadata(v);
+    CHECK(fntfs_test_metadata_is_dirty(v), "metadata dirtied");
+    CHECK(fntfs_sync(v) == 0 && !fntfs_test_metadata_is_dirty(v),
+          "sync did not flush system metadata");
+    g_fail_flush = true;
+    CHECK(fntfs_sync(v) == -EIO, "sync must propagate device failure");
+    g_fail_flush = false;
 
     /* --- create file, write, read back --- */
     fntfs_attrs fa;
@@ -468,9 +486,24 @@ int main(int argc, char **argv)
     /* --- settimes --- */
     fntfs_attrs tset = {0};
     tset.mtime_sec = 946684800; /* 2000-01-01 */
-    CHECK(fntfs_settimes(v, fa.inum, &tset, FNTFS_SET_MTIME) == 0, "settimes");
+    tset.atime_sec = 978307200; /* 2001-01-01, distinct from MFT change time */
+    tset.crtime_sec = 915148800; /* 1999-01-01 */
+    CHECK(fntfs_settimes(v, fa.inum, &tset,
+                         FNTFS_SET_MTIME | FNTFS_SET_ATIME | FNTFS_SET_CRTIME) == 0,
+          "settimes");
     CHECK(fntfs_getattr(v, fa.inum, &a) == 0 && a.mtime_sec == 946684800,
           "mtime=%lld", (long long)a.mtime_sec);
+    CHECK(a.atime_sec == tset.atime_sec && a.crtime_sec == tset.crtime_sec,
+          "access/birth times not applied");
+    CHECK(fntfs_forget(v, fa.inum) == 0, "flush times");
+    CHECK(fntfs_getattr(v, fa.inum, &a) == 0 && a.atime_sec == tset.atime_sec,
+          "access time must persist after inode reopen");
+    // Setter succeeds in memory, but inode close writes the changed metadata.
+    // A close failure must be returned to the caller.
+    g_fail_writes = 100; // Keep failing through libntfs-3g's internal retries.
+    CHECK(fntfs_settimes(v, fa.inum, &tset, FNTFS_SET_ATIME) < 0,
+          "settimes must propagate inode close failure");
+    g_fail_writes = 0;
 
     /* --- winattrs --- */
     CHECK(fntfs_setwinattrs(v, fa.inum, FNTFS_WINATTR_HIDDEN) == 0, "winattrs");

@@ -142,6 +142,10 @@ struct VolumeItem: Identifiable, Hashable {
     var nobrowse: Bool
     var usedBytes: Int64
     var freeBytes: Int64
+    /// Stable identifiers used to revalidate a destructive erase. BSD disk
+    /// numbers, size, and partition type can all be reused after a replug.
+    var volumeUUID: String? = nil
+    var diskUUID: String? = nil
     /// True for the placeholder rows shown when no volumes are detected.
     /// Sample rows must never reach diskutil/mkntfs.
     var isSample: Bool = false
@@ -190,6 +194,24 @@ final class VolumeStore: ObservableObject {
     /// and devices currently being processed (guard against overlapping runs).
     private var remountAttempts: [String: Date] = [:]
     private var remountInFlight: Set<String> = []
+    private var diskOperations = 0
+    var updatePreparationInProgress = false
+
+    func updateSafetySnapshot() -> UpdateSafetySnapshot {
+        var buf: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo_r_np(&buf, MNT_NOWAIT)
+        guard count > 0, let list = buf else {
+            if let buf { free(buf) }
+            return UpdateSafetySnapshot(activeOperations: diskOperations + remountInFlight.count,
+                                        mountedVolumes: nil)
+        }
+        defer { free(list) }
+        let mounts = UnsafeBufferPointer(start: list, count: Int(count))
+            .filter { Self.cStr16($0.f_fstypename) == "mntfs" }
+            .map { Self.cStr16($0.f_mntonname) }
+        return UpdateSafetySnapshot(activeOperations: diskOperations + remountInFlight.count,
+                                    mountedVolumes: mounts)
+    }
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
@@ -314,6 +336,8 @@ final class VolumeStore: ObservableObject {
     }
 
     func installLabelSupport() {
+        guard !updatePreparationInProgress else { return }
+        diskOperations += 1
         offerLabelSupport = false
         Task.detached(priority: .userInitiated) {
             let ok = Self.doInstallLabelSupport()
@@ -322,6 +346,7 @@ final class VolumeStore: ObservableObject {
             // until remounted. Remount them once so the new name shows immediately.
             if ok { Self.remountNTFSVolumes() }
             await MainActor.run {
+                self.diskOperations -= 1
                 self.actionMessage = ok
                     ? "Done — NTFS drives now show as “Windows NT File System (NTFS)” in Finder and Disk Utility."
                     : "Could not install NTFS name support (admin authorization is required)."
@@ -432,17 +457,17 @@ final class VolumeStore: ObservableObject {
             as? [String: Any]
     }
 
-    /// Kernel filesystem type for a mount point (statfs f_fstypename): "ntfs",
-    /// "exfat", "apfs"… This is the ground truth. Our driver reports "ntfs"
-    /// (same as Apple's read-only handler — telling them apart needs the
-    /// writable flag), while diskutil's FilesystemType/Name still misreport
-    /// FSKit NTFS volumes as "exfat".
-    nonisolated private static func mountFSType(_ path: String) -> String {
+    /// Kernel mount properties are authoritative; diskutil may mislabel FSKit
+    /// volumes. A /Volumes path alone doesn't prove a mount is browsable.
+    nonisolated private static func mountDetails(_ path: String)
+        -> (type: String, readOnly: Bool, noBrowse: Bool)? {
         var s = statfs()
-        guard statfs(path, &s) == 0 else { return "" }
-        return withUnsafeBytes(of: s.f_fstypename) {
+        guard statfs(path, &s) == 0 else { return nil }
+        let type = withUnsafeBytes(of: s.f_fstypename) {
             String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
         }
+        return (type, s.f_flags & UInt32(MNT_RDONLY) != 0,
+                s.f_flags & UInt32(MNT_DONTBROWSE) != 0)
     }
 
     /// True if any NTFS volume is mounted READ/WRITE. Only our FSKit driver
@@ -470,12 +495,14 @@ final class VolumeStore: ObservableObject {
     /// remount — if the extension isn't ready the volume stays read-only and a
     /// later trigger retries; if it is, our writable driver takes over.
     func autoRemountReadOnlyNTFS(force: Bool = false) {
+        guard !updatePreparationInProgress else { return }
         Task.detached(priority: .utility) {
             let devs = Self.readOnlyAppleNTFSDevices()
             guard !devs.isEmpty else { return }
             let now = Date()
             let todo: [String] = await MainActor.run {
-                devs.filter { dev in
+                guard !self.updatePreparationInProgress else { return [] }
+                return devs.filter { dev in
                     if self.remountInFlight.contains(dev) { return false }
                     if !force, let last = self.remountAttempts[dev],
                        now.timeIntervalSince(last) < 8 { return false }
@@ -527,6 +554,11 @@ final class VolumeStore: ObservableObject {
               let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
         var ids: [String] = []
         for disk in disks {
+            // Partitionless NTFS media has no Partitions/APFSVolumes array.
+            if disk["Partitions"] == nil, disk["APFSVolumes"] == nil,
+               let id = disk["DeviceIdentifier"] as? String {
+                ids.append(id)
+            }
             if let parts = disk["Partitions"] as? [[String: Any]] {
                 ids += parts.compactMap { $0["DeviceIdentifier"] as? String }
             }
@@ -545,7 +577,6 @@ final class VolumeStore: ObservableObject {
                 ?? (info["FilesystemName"] as? String) ?? ""
             let content = (info["Content"] as? String) ?? ""
             let mount = (info["MountPoint"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            let writable = (info["WritableVolume"] as? NSNumber)?.boolValue ?? true
             let ejectable = (info["Ejectable"] as? NSNumber)?.boolValue ?? false
             let dev = (info["DeviceNode"] as? String) ?? "/dev/\(id)"
             // Detect real NTFS from the KERNEL mount type (statfs f_fstypename),
@@ -553,7 +584,10 @@ final class VolumeStore: ObservableObject {
             // volumes as "exfat" — and NOT the MBR partition byte (an exFAT drive
             // reformatted over a former NTFS one keeps partition type 0x07). Our
             // driver mounts as "mntfs", Apple's read-only handler as "ntfs".
-            let kfs = mount.map { Self.mountFSType($0) } ?? ""
+            let details = mount.flatMap { Self.mountDetails($0) }
+            let kfs = details?.type ?? ""
+            let writable = details.map { !$0.readOnly }
+                ?? (info["WritableVolume"] as? NSNumber)?.boolValue ?? true
             let isNTFS: Bool
             if kfs == "mntfs" || kfs == "ntfs" {
                 isNTFS = true
@@ -569,8 +603,9 @@ final class VolumeStore: ObservableObject {
                 free = (a[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
                 used = max(0, total - free)
             }
-            let browsable = mount == "/" || (mount?.hasPrefix("/Volumes") ?? false)
-            let nobrowse = mount.map { !$0.hasPrefix("/Volumes") && $0 != "/" } ?? false
+            let nobrowse = details?.noBrowse ?? false
+            let browsable = !nobrowse &&
+                (mount == "/" || (mount?.hasPrefix("/Volumes/") ?? false))
 
             // Keep the list useful: every NTFS disk (mounted or not, so it can
             // be mounted), plus normal browsable volumes. Hide the APFS system
@@ -582,7 +617,9 @@ final class VolumeStore: ObservableObject {
                 id: id, name: name, sizeBytes: size, device: dev, fileSystem: fs,
                 content: content, mountPoint: mount, writable: writable,
                 ejectable: ejectable, isNTFS: isNTFS, nobrowse: nobrowse,
-                usedBytes: used, freeBytes: free))
+                usedBytes: used, freeBytes: free,
+                volumeUUID: info["VolumeUUID"] as? String,
+                diskUUID: info["DiskUUID"] as? String))
         }
         return items
     }
@@ -590,6 +627,10 @@ final class VolumeStore: ObservableObject {
     /// True when `v` is a real volume that diskutil may act on. Sample rows
     /// (and anything without a /dev/disk path) are display-only.
     private func actionable(_ v: VolumeItem) -> Bool {
+        if updatePreparationInProgress {
+            actionMessage = "MNtfs is preparing an update. Try again after it restarts."
+            return false
+        }
         if v.isSample || usingSampleData || !v.device.hasPrefix("/dev/disk") {
             actionMessage = "This is sample data — plug in a real drive first."
             return false
@@ -599,10 +640,12 @@ final class VolumeStore: ObservableObject {
 
     func toggleMount(_ v: VolumeItem) {
         guard actionable(v) else { return }
+        diskOperations += 1
         let mounting = !v.mounted
         Task.detached(priority: .userInitiated) {
             let r = Self.run([mounting ? "mount" : "unmount", v.device])
             await MainActor.run {
+                self.diskOperations -= 1
                 if !r.ok {   // trust the exit code, not a substring match
                     self.actionMessage = r.text.isEmpty
                         ? "diskutil \(mounting ? "mount" : "unmount") failed (status \(r.status))."
@@ -615,10 +658,12 @@ final class VolumeStore: ObservableObject {
 
     func verify(_ v: VolumeItem) {
         guard actionable(v) else { return }
+        diskOperations += 1
         verifying = true
         Task.detached(priority: .userInitiated) {
             let r = Self.run(["verifyVolume", v.device])
             await MainActor.run {
+                self.diskOperations -= 1
                 self.verifying = false
                 self.actionMessage = r.text.isEmpty ? "No output." : r.text
             }
@@ -629,12 +674,16 @@ final class VolumeStore: ObservableObject {
 
     func erase(_ v: VolumeItem, newName: String) {
         guard actionable(v) else { eraseTarget = nil; return }
+        diskOperations += 1
         erasing = true
         Task.detached(priority: .userInitiated) {
             let result = Self.performErase(device: v.device, name: newName,
                                            expectedSize: v.sizeBytes,
-                                           expectedContent: v.content)
+                                           expectedContent: v.content,
+                                           expectedVolumeUUID: v.volumeUUID,
+                                           expectedDiskUUID: v.diskUUID)
             await MainActor.run {
+                self.diskOperations -= 1
                 self.erasing = false
                 self.eraseTarget = nil
                 self.actionMessage = result
@@ -649,12 +698,22 @@ final class VolumeStore: ObservableObject {
 
     nonisolated private static func performErase(device: String, name: String,
                                                  expectedSize: Int64,
-                                                 expectedContent: String) -> String {
+                                                 expectedContent: String,
+                                                 expectedVolumeUUID: String?,
+                                                 expectedDiskUUID: String?) -> String {
         guard device.hasPrefix("/dev/disk") else {
             return "Erase refused: no real device selected."
         }
         guard let mkntfs = Bundle.main.path(forResource: "mkntfs", ofType: nil) else {
             return "Erase failed: the mkntfs formatter is missing from the app bundle."
+        }
+        let identity = eraseIdentity(volumeUUID: expectedVolumeUUID,
+                                     diskUUID: expectedDiskUUID)
+        // Same-sized drives can have identical partition types. Require at
+        // least one stable UUID and check it before unmounting anything.
+        guard let before = plist(run(["info", "-plist", device])),
+              matchesEraseIdentity(before, expected: identity) else {
+            return "Erase aborted: the selected drive's identity cannot be confirmed. Refresh the drive list and try again."
         }
         // The user has confirmed destruction, so force the volume unmounted to
         // be sure mkntfs can take the raw partition.
@@ -677,6 +736,9 @@ final class VolumeStore: ObservableObject {
                 + (um.text.isEmpty ? "." : ":\n\(um.text)")
         }
         let contentNow = d["Content"] as? String ?? ""
+        guard matchesEraseIdentity(d, expected: identity) else {
+            return "Erase aborted: \(device) is not the drive that was selected (UUID changed)."
+        }
         guard expectedContent.isEmpty || contentNow == expectedContent else {
             return "Erase aborted: \(device) is not the partition that was selected (type changed)."
         }
@@ -702,6 +764,9 @@ final class VolumeStore: ObservableObject {
         recheck += " && test -z \"$(diskutil info -plist \(q) | plutil -extract MountPoint raw - 2>/dev/null)\""
         if !expectedContent.isEmpty {
             recheck += " && test \"$(diskutil info -plist \(q) | plutil -extract Content raw -)\" = \(shQuote(expectedContent))"
+        }
+        for key in identity.keys.sorted() {
+            recheck += " && test \"$(diskutil info -plist \(q) | plutil -extract \(key) raw -)\" = \(shQuote(identity[key]!))"
         }
         let shell = "{ \(recheck) ; } || { echo MNTFS_TARGET_CHANGED; exit 90; }; "
             + "\(shQuote(mkntfs)) -Q -F -L \(shQuote(label)) \(q)"
@@ -737,6 +802,21 @@ final class VolumeStore: ObservableObject {
             return Self.fdaMessage
         }
         return "Erase failed:\n\(outText)"
+    }
+
+    nonisolated static func eraseIdentity(volumeUUID: String?,
+                                         diskUUID: String?) -> [String: String] {
+        var identity: [String: String] = [:]
+        if let volumeUUID, !volumeUUID.isEmpty { identity["VolumeUUID"] = volumeUUID }
+        if let diskUUID, !diskUUID.isEmpty { identity["DiskUUID"] = diskUUID }
+        return identity
+    }
+
+    nonisolated static func matchesEraseIdentity(_ info: [String: Any],
+                                                 expected: [String: String]) -> Bool {
+        !expected.isEmpty && expected.allSatisfy { key, value in
+            (info[key] as? String)?.caseInsensitiveCompare(value) == .orderedSame
+        }
     }
 
     /// Marker + user guidance shown when Erase is blocked by missing

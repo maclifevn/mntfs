@@ -9,6 +9,9 @@
 /* Begin PBXBuildFile section */
 		AA0000000000000000000201 /* FastNTFSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000101 /* FastNTFSApp.swift */; };
 		AA0000000000000000000202 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000102 /* ContentView.swift */; };
+		AA0000000000000000000203 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000104 /* UpdateController.swift */; };
+		AA0000000000000000000204 /* UpdateSafety.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000105 /* UpdateSafety.swift */; };
+		AA0000000000000000000205 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000B02 /* Sparkle */; };
 		AA0000000000000000000211 /* Extension.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000111 /* Extension.swift */; };
 		AA0000000000000000000212 /* NTFSFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000112 /* NTFSFileSystem.swift */; };
 		AA0000000000000000000213 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000113 /* NTFSVolume.swift */; };
@@ -50,6 +53,9 @@
 		AA0000000000000000000101 /* FastNTFSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FastNTFSApp.swift; sourceTree = "<group>"; };
 		AA0000000000000000000102 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		AA0000000000000000000103 /* FastNTFS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FastNTFS.entitlements; sourceTree = "<group>"; };
+		AA0000000000000000000104 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
+		AA0000000000000000000105 /* UpdateSafety.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateSafety.swift; sourceTree = "<group>"; };
+		AA0000000000000000000106 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA0000000000000000000111 /* Extension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Extension.swift; sourceTree = "<group>"; };
 		AA0000000000000000000112 /* NTFSFileSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSFileSystem.swift; sourceTree = "<group>"; };
 		AA0000000000000000000113 /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
@@ -69,6 +75,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0000000000000000000205 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -105,6 +112,9 @@
 				AA0000000000000000000101 /* FastNTFSApp.swift */,
 				AA0000000000000000000102 /* ContentView.swift */,
 				AA0000000000000000000103 /* FastNTFS.entitlements */,
+				AA0000000000000000000104 /* UpdateController.swift */,
+				AA0000000000000000000105 /* UpdateSafety.swift */,
+				AA0000000000000000000106 /* Info.plist */,
 				AA000000000000000000011B /* mkntfs */,
 				AA000000000000000000011C /* Assets.xcassets */,
 			);
@@ -164,6 +174,9 @@
 				AA0000000000000000000901 /* PBXTargetDependency */,
 			);
 			name = FastNTFS;
+			packageProductDependencies = (
+				AA0000000000000000000B02 /* Sparkle */,
+			);
 			productName = FastNTFS;
 			productReference = AA0000000000000000000021 /* FastNTFS.app */;
 			productType = "com.apple.product-type.application";
@@ -211,6 +224,9 @@
 				Base,
 			);
 			mainGroup = AA0000000000000000000601;
+			packageReferences = (
+				AA0000000000000000000B01 /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			productRefGroup = AA0000000000000000000605 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -257,6 +273,8 @@
 			files = (
 				AA0000000000000000000201 /* FastNTFSApp.swift in Sources */,
 				AA0000000000000000000202 /* ContentView.swift in Sources */,
+				AA0000000000000000000203 /* UpdateController.swift in Sources */,
+				AA0000000000000000000204 /* UpdateSafety.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -340,9 +358,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/FastNTFS.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Sources/App/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = MNtfs;
 				PRODUCT_NAME = MNtfs;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -351,7 +370,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.fastntfs.FastNTFS;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};
@@ -364,9 +383,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/FastNTFS.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Sources/App/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = MNtfs;
 				PRODUCT_NAME = MNtfs;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -375,7 +395,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.fastntfs.FastNTFS;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};
@@ -386,7 +406,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Sources/FSModule/FSModule.entitlements;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"HAVE_CONFIG_H=1",
@@ -398,7 +418,7 @@
 					"$(PROJECT_DIR)/vendor/ntfs-3g/include/ntfs-3g",
 				);
 				INFOPLIST_FILE = Sources/FSModule/Info.plist;
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.1.2;
 				OTHER_LDFLAGS = (
 					"$(PROJECT_DIR)/vendor/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a",
 					"-framework",
@@ -416,7 +436,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Sources/FSModule/FSModule.entitlements;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"HAVE_CONFIG_H=1",
@@ -428,7 +448,7 @@
 					"$(PROJECT_DIR)/vendor/ntfs-3g/include/ntfs-3g",
 				);
 				INFOPLIST_FILE = Sources/FSModule/Info.plist;
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.1.2;
 				OTHER_LDFLAGS = (
 					"$(PROJECT_DIR)/vendor/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a",
 					"-framework",
@@ -472,6 +492,22 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		AA0000000000000000000B01 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = { kind = exactVersion; version = 2.9.6; };
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA0000000000000000000B02 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA0000000000000000000B01 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = AA0000000000000000000001 /* Project object */;
 }
