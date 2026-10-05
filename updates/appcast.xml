@@ -1,0 +1,21 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>MNtfs</title>
+        <item>
+            <title>0.1.2</title>
+            <pubDate>Mon, 05 Oct 2026 10:52:01 +0700</pubDate>
+            <link>https://maclifevn.github.io/mntfs/</link>
+            <sparkle:phasedRolloutInterval>86400</sparkle:phasedRolloutInterval>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:releaseNotesLink sparkle:edSignature="/hmpiF01I0up69zyXNPnqDHtaICSFUm6Bqj0mqlF1gxAktb89eVuGhQ28FSXE1/2xyH3Su6uiQWqJMlAZp4kDA==" sparkle:length="452">https://maclifevn.github.io/mntfs/updates/MNtfs-0.1.2.md</sparkle:releaseNotesLink>
+            <enclosure url="https://github.com/maclifevn/mntfs/releases/download/v0.1.2/MNtfs-0.1.2.zip" length="4308057" type="application/octet-stream" sparkle:edSignature="kkh1WgPuqs7aGfgeS9OSGQf3ie6IbWhAD9EoGdfVE6sTbkLKKtrJNCAKY0x3hPjne/ct5S+ak2IoBmgDbfitCg=="/>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: zf0btayQcCAc8Qj5qMT1f1oFEmnd43soBFqltk9U5kJnaQk3Wookzmi0PIC6GglYLyjk/3dBZ2xCG25FHpOkBw==
+length: 1261
+-->
