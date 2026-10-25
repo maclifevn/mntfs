@@ -57,6 +57,17 @@ and App Store Connect notarization credentials are still required.
    Alternatively set `MNTFS_NOTARY_PROFILE` to an existing `notarytool` Keychain
    profile for the same Apple team. Run the release script locally:
 
+   The existing release Mac has the `MNotch-notary` profile for team
+   `CF5PGH3KGK`; it was also used for MNtfs 0.1.2. Reuse it without exporting
+   credentials:
+
+```sh
+xcrun notarytool history --keychain-profile MNotch-notary
+MNTFS_NOTARY_PROFILE=MNotch-notary ./scripts/release.sh 0.1.3 release-notes/0.1.3.md
+```
+
+For a new release Mac configured through environment variables:
+
 ```sh
 ./scripts/release.sh 0.1.2 release-notes/0.1.2.md --bootstrap
 # Later releases omit --bootstrap:
