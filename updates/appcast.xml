@@ -3,6 +3,18 @@
     <channel>
         <title>MNtfs</title>
         <item>
+            <title>0.1.3</title>
+            <pubDate>Sun, 25 Oct 2026 13:26:08 +0700</pubDate>
+            <link>https://maclifevn.github.io/mntfs/</link>
+            <sparkle:phasedRolloutInterval>86400</sparkle:phasedRolloutInterval>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>0.1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:releaseNotesLink sparkle:edSignature="6VdHKqTrDs6WnF2LUfSJpkmyvQy/kKJcAuCh1uWNzOdW/FJ05Ws2LxAYDEDjr7KhxTYLQmjazfH6+7+1UrpxBA==" sparkle:length="447">https://maclifevn.github.io/mntfs/updates/MNtfs-0.1.3.md</sparkle:releaseNotesLink>
+            <enclosure url="https://github.com/maclifevn/mntfs/releases/download/v0.1.3/MNtfs-0.1.3.zip" length="4315586" type="application/octet-stream" sparkle:edSignature="BsjvGxnAge+sZoEsNfPLSyZzm2WvJ9QnyLCeZFKJjgOHqmFVKklFzNmgg0sLePZk9PZ1cbI3bun3AU29hZ6YDw=="/>
+        </item>
+        <item>
             <title>0.1.2</title>
             <pubDate>Mon, 05 Oct 2026 10:52:01 +0700</pubDate>
             <link>https://maclifevn.github.io/mntfs/</link>
@@ -15,7 +27,8 @@
             <enclosure url="https://github.com/maclifevn/mntfs/releases/download/v0.1.2/MNtfs-0.1.2.zip" length="4308057" type="application/octet-stream" sparkle:edSignature="kkh1WgPuqs7aGfgeS9OSGQf3ie6IbWhAD9EoGdfVE6sTbkLKKtrJNCAKY0x3hPjne/ct5S+ak2IoBmgDbfitCg=="/>
         </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: zf0btayQcCAc8Qj5qMT1f1oFEmnd43soBFqltk9U5kJnaQk3Wookzmi0PIC6GglYLyjk/3dBZ2xCG25FHpOkBw==
-length: 1261
+</rss>
+<!-- sparkle-signatures:
+edSignature: tJm4Y3T+EoNgR+VqpFzTByvd0H65sMsJpkRpDHQZ0hsCq0RDN/t8U7rQgpMyucOyPJGhZG5Hl39IpEet5sgYAw==
+length: 2332
 -->
