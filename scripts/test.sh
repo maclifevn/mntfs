@@ -56,6 +56,11 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
 "$TASK_TMP/test_erase"
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/App/ContentView.swift Sources/App/UpdateSafety.swift \
+    tests/test_label_support.swift -o "$TASK_TMP/test_label_support"
+"$TASK_TMP/test_label_support"
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
     Sources/App/UpdateSafety.swift tests/test_updates.swift -o "$TASK_TMP/test_updates"
 "$TASK_TMP/test_updates"
 python3 tests/test_update_archive.py

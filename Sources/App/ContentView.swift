@@ -340,16 +340,25 @@ final class VolumeStore: ObservableObject {
         diskOperations += 1
         offerLabelSupport = false
         Task.detached(priority: .userInitiated) {
-            let ok = Self.doInstallLabelSupport()
+            let result = Self.doInstallLabelSupport()
             // Finder/Disk Utility cache a volume's display name from mount time,
             // so already-mounted NTFS drives keep the old "ExFAT"/"Unknown" label
             // until remounted. Remount them once so the new name shows immediately.
-            if ok { Self.remountNTFSVolumes() }
+            if result.ok {
+                Self.remountNTFSVolumes()
+            } else {
+                NSLog("MNtfs: NTFS name support installation failed (%d): %@",
+                      result.status, result.text)
+            }
             await MainActor.run {
                 self.diskOperations -= 1
-                self.actionMessage = ok
+                let detail = result.text.isEmpty
+                    ? "The installer exited with status \(result.status)."
+                    : result.text
+                self.actionMessage = result.ok
                     ? "Done — NTFS drives now show as “Windows NT File System (NTFS)” in Finder and Disk Utility."
-                    : "Could not install NTFS name support (admin authorization is required)."
+                    : "Could not install NTFS name support.\n\n\(detail)\n\n"
+                    + "This optional component only changes the name shown in Finder and Disk Utility."
                 self.refresh()
             }
         }
@@ -395,26 +404,64 @@ final class VolumeStore: ObservableObject {
         }
     }
 
-    nonisolated private static func doInstallLabelSupport() -> Bool {
+    /// Keep the filesystem copy separate from authorization and ownership so
+    /// the install can be checked against disposable directories without root.
+    nonisolated static func labelSupportCopyScript(from source: String, to destination: String) -> String {
+        func quoted(_ path: String) -> String {
+            "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        let parent = (destination as NSString).deletingLastPathComponent
+        // /Library/Filesystems is optional and can be absent on a fresh Mac.
+        return "/bin/mkdir -p -m 0755 \(quoted(parent))"
+            + " && /bin/rm -rf \(quoted(destination))"
+            + " && /bin/cp -R \(quoted(source)) \(quoted(destination))"
+            + " && /bin/chmod -R u=rwX,go=rX \(quoted(destination))"
+    }
+
+    nonisolated static func labelSupportAppleScript(_ shellScript: String) -> String {
+        let escaped = shellScript.replacingOccurrences(of: "\\", with: "\\\\")
+                                 .replacingOccurrences(of: "\"", with: "\\\"")
+        return "do shell script \"\(escaped)\""
+    }
+
+    nonisolated private static func doInstallLabelSupport() -> RunResult {
         let fm = FileManager.default
-        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("mntfs.fs")
-        try? fm.removeItem(atPath: tmp)
+        let staging = fm.temporaryDirectory.appendingPathComponent("mntfs-label-\(UUID().uuidString)")
+        let tmp = staging.appendingPathComponent("mntfs.fs").path
+        defer { try? fm.removeItem(at: staging) }
         do {
+            try fm.createDirectory(at: staging, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: 0o700])
             try fm.createDirectory(atPath: tmp + "/Contents/Resources",
                                    withIntermediateDirectories: true)
             try labelBundleInfoPlist.write(toFile: tmp + "/Contents/Info.plist",
                                            atomically: true, encoding: .utf8)
-        } catch { return false }
-        let script = "rm -rf '\(labelBundlePath)' && cp -R '\(tmp)' '\(labelBundlePath)' "
-                   + "&& chown -R root:wheel '\(labelBundlePath)'"
-        let esc = script.replacingOccurrences(of: "\\", with: "\\\\")
-                        .replacingOccurrences(of: "\"", with: "\\\"")
+        } catch {
+            return RunResult(status: -1, out: Data(
+                "Could not prepare NTFS name support: \(error.localizedDescription)".utf8))
+        }
+        let script = labelSupportCopyScript(from: tmp, to: labelBundlePath)
+                   + " && /usr/sbin/chown -R root:wheel '\(labelBundlePath)'"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", "do shell script \"\(esc)\" with administrator privileges"]
-        do { try p.run() } catch { return false }
+        p.arguments = ["-e", labelSupportAppleScript(script) + " with administrator privileges"]
+        let output = Pipe()
+        p.standardOutput = output
+        p.standardError = output
+        do { try p.run() } catch {
+            return RunResult(status: -1, out: Data(
+                "Could not start the installer: \(error.localizedDescription)".utf8))
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        return p.terminationStatus == 0 && labelSupportInstalled()
+        guard p.terminationStatus == 0 else {
+            return RunResult(status: p.terminationStatus, out: data)
+        }
+        guard labelSupportInstalled() else {
+            return RunResult(status: -1, out: Data(
+                "The installed NTFS name bundle is missing, unreadable, or invalid.".utf8))
+        }
+        return RunResult(status: 0, out: data)
     }
 
     private func apply(_ all: [VolumeItem]) {
@@ -428,7 +475,7 @@ final class VolumeStore: ObservableObject {
         scanning = false
     }
 
-    /// Result of a diskutil invocation. Keeps the exit status so callers can tell
+    /// Result of a tool invocation. Keeps the exit status so callers can tell
     /// a real failure from merely-unexpected output (grepping stdout is fragile).
     struct RunResult {
         let status: Int32
