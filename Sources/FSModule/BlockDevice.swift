@@ -9,10 +9,48 @@
 import Foundation
 import FSKit
 
-final class BlockDevice {
-    let resource: FSBlockDeviceResource
+/// The same adapter is exercised with a fault-injecting resource in tests.
+protocol BlockResourceIO: AnyObject {
+    var blockCount: UInt64 { get }
+    var blockSize: UInt64 { get }
+    func read(into buffer: UnsafeMutableRawBufferPointer, startingAt offset: off_t,
+              length: Int) throws -> Int
+    func write(from buffer: UnsafeRawBufferPointer, startingAt offset: off_t,
+               length: Int) throws -> Int
+    func metadataFlush() throws
+}
 
-    init(resource: FSBlockDeviceResource) {
+extension FSBlockDeviceResource: BlockResourceIO {}
+
+final class BlockDevice {
+    let resource: any BlockResourceIO
+    private let statisticsLock = NSLock()
+    private var statistics = NTFSIOStatistics()
+
+    var ioStatistics: NTFSIOStatistics {
+        statisticsLock.lock(); defer { statisticsLock.unlock() }
+        return statistics
+    }
+
+    enum Operation { case read, write, flush }
+    func record(_ operation: Operation, error: Int32? = nil, short: Bool = false) {
+        statisticsLock.lock(); defer { statisticsLock.unlock() }
+        switch operation {
+        case .read:
+            statistics.readCalls &+= 1
+            if error != nil { statistics.readErrors &+= 1 }
+        case .write:
+            statistics.writeCalls &+= 1
+            if error != nil { statistics.writeErrors &+= 1 }
+            if short { statistics.shortWrites &+= 1 }
+        case .flush:
+            statistics.flushCalls &+= 1
+            if error != nil { statistics.flushErrors &+= 1 }
+        }
+        if let error { statistics.lastError = error }
+    }
+
+    init(resource: any BlockResourceIO) {
         self.resource = resource
     }
 
@@ -41,9 +79,12 @@ let devPread: fntfs_pread_cb = { ctx, buf, count, offset in
         let buffer = UnsafeMutableRawBufferPointer(start: buf, count: Int(count))
         let n = try dev.resource.read(into: buffer, startingAt: offset,
                                       length: Int(count))
+        dev.record(.read)
         return Int64(n)
     } catch {
-        return -Int64(posixCode(error))
+        let code = posixCode(error)
+        dev.record(.read, error: code)
+        return -Int64(code)
     }
 }
 
@@ -54,13 +95,28 @@ let devPwrite: fntfs_pwrite_cb = { ctx, buf, count, offset in
         let buffer = UnsafeRawBufferPointer(start: buf, count: Int(count))
         let n = try dev.resource.write(from: buffer, startingAt: offset,
                                        length: Int(count))
+        dev.record(.write, short: n != Int(count))
         return Int64(n)
     } catch {
-        return -Int64(posixCode(error))
+        let code = posixCode(error)
+        dev.record(.write, error: code)
+        return -Int64(code)
     }
 }
 
-let devFlush: fntfs_flush_cb = { _ in
-    // Writes go straight to the device through fskitd; no extra cache to drop.
-    return 0
+let devFlush: fntfs_flush_cb = { ctx in
+    guard let ctx else { return -EINVAL }
+    let dev = Unmanaged<BlockDevice>.fromOpaque(ctx).takeUnretainedValue()
+    do {
+        // The public FSKit API flushes the resource's kernel buffer cache.
+        // It does not expose F_FULLFSYNC/DKIOCSYNCHRONIZECACHE or promise that
+        // a USB controller's volatile cache survives sudden power loss.
+        try dev.resource.metadataFlush()
+        dev.record(.flush)
+        return 0
+    } catch {
+        let code = posixCode(error)
+        dev.record(.flush, error: code)
+        return -code
+    }
 }

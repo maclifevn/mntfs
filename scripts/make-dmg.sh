@@ -23,12 +23,26 @@ ICON_Y=200
 ICON_SIZE=128
 
 APPNAME=$(basename "$APP")                 # e.g. MNtfs.app
-STAGE=$(mktemp -d /tmp/mntfs-dmg.XXXXXX)
-RW=$(mktemp -u /tmp/mntfs-rw.XXXXXX).dmg
+WORK=$(mktemp -d /tmp/mntfs-dmg.XXXXXX)
+WORK=$(CDPATH= cd -- "$WORK" && pwd -P)
+STAGE="$WORK/stage"
+RW="$WORK/install.dmg"
+VOL="$WORK/mount"
+MOUNT_DEV=""
+mkdir "$STAGE"
+
+is_mounted() {
+    python3 -c 'import os, sys; sys.exit(0 if os.path.ismount(sys.argv[1]) else 1)' "$VOL"
+}
 
 cleanup() {
-    [ -n "$MOUNT_DEV" ] && hdiutil detach "$MOUNT_DEV" -quiet 2>/dev/null || true
-    rm -rf "$STAGE" "$RW"
+    if is_mounted; then
+        if ! hdiutil detach "${MOUNT_DEV:-$VOL}" -quiet 2>/dev/null; then
+            echo "Build image is still mounted; preserving $WORK for cleanup." >&2
+            return
+        fi
+    fi
+    rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -49,12 +63,21 @@ hdiutil create -srcfolder "$STAGE" -volname "$VOLNAME" -fs HFS+ \
     -format UDRW -size "${MB}m" "$RW" -quiet
 
 echo "==> mount"
-# NOT -quiet: quiet suppresses the device/mount listing we need to parse.
-ATTACH=$(hdiutil attach "$RW" -readwrite -noverify -noautoopen)
-MOUNT_DEV=$(echo "$ATTACH" | grep 'Apple_HFS' | awk '{print $1}')
-VOL="/Volumes/$VOLNAME"
-[ -d "$VOL" ] || VOL=$(echo "$ATTACH" | grep 'Apple_HFS' | sed -n 's/.*\(\/Volumes\/.*\)$/\1/p' | head -1)
-[ -n "$MOUNT_DEV" ] && [ -d "$VOL" ] || { echo "mount failed"; exit 1; }
+# A previous installer can have the same volume name. Mount at a private path
+# and use the returned whole-device identity; never detach a volume by label.
+hdiutil attach "$RW" -readwrite -noverify -noautoopen -nobrowse \
+    -mountpoint "$VOL" -plist > "$WORK/attach.plist"
+MOUNT_DEV=$(python3 - "$WORK/attach.plist" "$VOL" <<'PY'
+import os, plistlib, re, sys
+with open(sys.argv[1], 'rb') as source:
+    entities = plistlib.load(source)['system-entities']
+assert any(os.path.realpath(e.get('mount-point', '')) == os.path.realpath(sys.argv[2])
+           for e in entities if e.get('mount-point')), 'Unexpected mount path: ' + repr(entities)
+devices = [e['dev-entry'] for e in entities if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', ''))]
+assert len(devices) == 1, 'Ambiguous image device'
+print(devices[0])
+PY
+)
 
 # Custom-icon bit on the volume, plus keep .background hidden.
 [ -f "$VOL/.VolumeIcon.icns" ] && SetFile -a C "$VOL" 2>/dev/null || true
@@ -63,7 +86,8 @@ echo "==> arrange window"
 set +e
 osascript 2>&1 <<APPLESCRIPT
 tell application "Finder"
-    tell disk "$VOLNAME"
+    set targetDisk to item (POSIX file "$VOL" as alias)
+    tell targetDisk
         open
         delay 0.5
         set current view of container window to icon view
@@ -90,10 +114,10 @@ sync; sync
 # .DS_Store is written lazily; give Finder a moment, then detach (retry: the
 # volume is briefly busy right after Finder closes the window).
 for i in 1 2 3 4 5 6; do
-    if hdiutil detach "$VOL" 2>/dev/null; then MOUNT_DEV=""; break; fi
+    if hdiutil detach "$MOUNT_DEV" 2>/dev/null; then MOUNT_DEV=""; break; fi
     sleep 1
 done
-[ -z "$MOUNT_DEV" ] || { hdiutil detach "$MOUNT_DEV" -force; MOUNT_DEV=""; }
+[ -z "$MOUNT_DEV" ] || { echo "Build image is busy; refusing to compress a mounted image." >&2; exit 1; }
 
 echo "==> compress"
 rm -f "$DMG"

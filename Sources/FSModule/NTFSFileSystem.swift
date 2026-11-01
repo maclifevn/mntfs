@@ -89,8 +89,9 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         }
 
         let label = String(cString: name)
-        log.info("mounted \(block.bsdName, privacy: .public) '\(label, privacy: .public)' readOnly=\(readOnly)")
-        let volume = NTFSVolume(device: dev, readOnly: readOnly, vol: v,
+        let effectiveReadOnly = fntfs_is_readonly(v)
+        log.info("mounted \(block.bsdName, privacy: .public) readOnly=\(effectiveReadOnly) safetyState=\(fntfs_mount_state(v))")
+        let volume = NTFSVolume(device: dev, readOnly: effectiveReadOnly, vol: v,
                                 name: label, serial: serial)
         activeVolume = volume
         activeDevice = dev
@@ -100,10 +101,10 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
     func unloadResource(resource: FSResource, options: FSTaskOptions,
                         replyHandler reply: @escaping (Error?) -> Void) {
-        activeVolume?.shutdownVolume()
+        let err = activeVolume?.shutdownVolume() ?? 0
         activeVolume = nil
         activeDevice = nil
-        reply(nil)
+        reply(err == 0 ? nil : posixError(-err))
     }
 
     func didFinishLoading() {
@@ -149,7 +150,10 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
             if state & UInt32(FNTFS_VSTATE_LOG_DIRTY) != 0 {
                 task.logMessage("MNtfs: the NTFS journal ($LogFile) has unreplayed state")
             }
-            task.logMessage("MNtfs: run `chkdsk /f` on Windows for a full repair, or let MNtfs mount it read-write to recover the journal and remove the hibernation image")
+            if state & UInt32(FNTFS_VSTATE_UNKNOWN) != 0 {
+                task.logMessage("MNtfs: one or more safety checks could not complete")
+            }
+            task.logMessage("MNtfs keeps this volume read-only. Resume Windows and shut down fully; run chkdsk /f on Windows if repair is needed. MNtfs never resets the journal or removes hiberfil.sys.")
             task.didComplete(error: posixError(EBUSY))
         }
         return progress

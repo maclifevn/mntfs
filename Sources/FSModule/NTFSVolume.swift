@@ -18,6 +18,10 @@ final class NTFSVolume: FSVolume {
     private let device: BlockDevice
     private let readOnly: Bool
     private var vol: OpaquePointer?
+    private var shutdownError: Int32 = 0
+    // Protect the native handle for the WHOLE callback, including two-pass
+    // xattr reads. Unmount cannot free it while another operation is using it.
+    private let operationLock = NSRecursiveLock()
 
     /// FSItem identity table: one NTFSItem instance per live inode.
     private var items: [UInt64: NTFSItem] = [:]
@@ -137,7 +141,7 @@ final class NTFSVolume: FSVolume {
         out.gid = 99
         out.linkCount = a.nlink
 
-        var mode: UInt32 = (type == .directory) ? 0o777 : 0o666
+        var mode: UInt32 = (type == .directory || type == .symlink) ? 0o777 : 0o666
         if a.win_attrs & UInt32(FNTFS_WINATTR_READONLY) != 0 {
             mode &= ~UInt32(0o222)
         }
@@ -171,7 +175,7 @@ final class NTFSVolume: FSVolume {
     /// on a read-only mount instead of letting them travel down to the bridge.
     private func requireWritableVolume() throws -> OpaquePointer {
         let v = try requireVolume()
-        if readOnly { throw posixError(EROFS) }
+        if readOnly || fntfs_is_readonly(v) { throw posixError(EROFS) }
         return v
     }
 
@@ -181,18 +185,117 @@ final class NTFSVolume: FSVolume {
     }
 
     private func utf8Name(_ name: FSFileName) throws -> String {
-        guard let s = name.string, !s.isEmpty, !s.contains("/") else {
+        guard let s = name.string, !s.isEmpty, !s.contains("/"), !s.contains("\0") else {
             throw posixError(EINVAL)
         }
         return s
     }
 
-    /// Flush all dirty state and release the on-disk volume.
-    func shutdownVolume() {
-        if let v = vol {
-            fntfs_unmount(v)
-            vol = nil
+    /// Attribute sizes may change between the query and read. Retry a bounded
+    /// number of times without returning a truncated value or allocating from
+    /// an unchecked on-disk length.
+    private func bridgeData(_ request: (UnsafeMutableRawPointer?, Int) -> Int64) throws -> Data {
+        for _ in 0..<3 {
+            let size = request(nil, 0)
+            guard size >= 0 else { throw posixError(Int32(-size)) }
+            guard size <= Int64(FNTFS_MAX_XATTR_SIZE) else { throw posixError(E2BIG) }
+            if size == 0 { return Data() }
+            var data = Data(count: Int(size))
+            let count = data.withUnsafeMutableBytes { request($0.baseAddress, $0.count) }
+            if count == -Int64(ERANGE) { continue }
+            guard count >= 0 else { throw posixError(Int32(-count)) }
+            guard count <= size else { throw posixError(EIO) }
+            data.count = Int(count)
+            return data
         }
+        throw posixError(EAGAIN)
+    }
+
+    /// Flush all dirty state and release the on-disk volume.
+    @discardableResult
+    func shutdownVolume() -> Int32 {
+        operationLock.lock(); defer { operationLock.unlock() }
+        if let v = vol {
+            let err = fntfs_unmount(v)
+            vol = nil
+            shutdownError = err
+            if err != 0 { NSLog("MNtfs: unmount failed to synchronize data (errno=%d)", -err) }
+            return err
+        }
+        return shutdownError
+    }
+}
+
+// MARK: - Extended attributes / alternate data streams
+
+extension NTFSVolume: FSVolume.XattrOperations {
+    func getXattr(named name: FSFileName, of item: FSItem,
+                  replyHandler reply: @escaping (Data?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
+        do {
+            let v = try requireVolume()
+            let it = try requireItem(item)
+            let key = try utf8Name(name)
+            let data: Data
+            if key == NTFSMountStatus.attributeName {
+                guard it.inum == fntfs_root_inum() else { throw posixError(ENOATTR) }
+                data = try JSONEncoder().encode(NTFSMountStatus(
+                    readOnly: readOnly || fntfs_is_readonly(v), safetyFlags: fntfs_mount_state(v),
+                    io: device.ioStatistics, failureError: fntfs_io_error(v) == 0 ? nil : fntfs_io_error(v)))
+            } else if key == NTFSMountStatus.reparseAttributeName {
+                data = try bridgeData { fntfs_get_reparse(v, it.inum, $0, $1) }
+            } else {
+                data = try bridgeData { fntfs_getxattr(v, it.inum, key, $0, $1) }
+            }
+            reply(data, nil)
+        } catch { reply(nil, error) }
+    }
+
+    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem,
+                  policy: FSVolume.SetXattrPolicy,
+                  replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
+        do {
+            let v = try requireWritableVolume()
+            let it = try requireItem(item)
+            let key = try utf8Name(name)
+            guard key != NTFSMountStatus.attributeName && key != NTFSMountStatus.reparseAttributeName else {
+                throw posixError(EPERM)
+            }
+            guard value != nil || policy == .delete else { throw posixError(EINVAL) }
+            let data = value ?? Data()
+            guard data.count <= Int(FNTFS_MAX_XATTR_SIZE) else { throw posixError(E2BIG) }
+            let option: Int32
+            switch policy {
+            case .alwaysSet: option = Int32(FNTFS_XATTR_SET)
+            case .mustCreate: option = Int32(FNTFS_XATTR_CREATE)
+            case .mustReplace: option = Int32(FNTFS_XATTR_REPLACE)
+            case .delete: option = Int32(FNTFS_XATTR_DELETE)
+            @unknown default: throw posixError(ENOTSUP)
+            }
+            let err = data.withUnsafeBytes {
+                fntfs_setxattr(v, it.inum, key, $0.baseAddress, $0.count, option)
+            }
+            if err != 0 { throw posixError(-err) }
+            reply(nil)
+        } catch { reply(error) }
+    }
+
+    func listXattrs(of item: FSItem,
+                    replyHandler reply: @escaping ([FSFileName]?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
+        do {
+            let v = try requireVolume()
+            let it = try requireItem(item)
+            let data = try bridgeData { fntfs_listxattr(v, it.inum, $0, $1) }
+            var names = try data.split(separator: 0).map { bytes -> String in
+                guard let name = String(bytes: bytes, encoding: .utf8) else { throw posixError(EILSEQ) }
+                return name
+            }.filter { $0 != NTFSMountStatus.attributeName && $0 != NTFSMountStatus.reparseAttributeName }
+            if it.inum == fntfs_root_inum() { names.append(NTFSMountStatus.attributeName) }
+            if fntfs_get_reparse(v, it.inum, nil, 0) >= 0 { names.append(NTFSMountStatus.reparseAttributeName) }
+            reply(names.map { FSFileName(string: $0) }, nil)
+        } catch { reply(nil, error) }
     }
 }
 
@@ -204,17 +307,24 @@ extension NTFSVolume: FSVolume.PathConfOperations {
     var restrictsOwnershipChanges: Bool { false }
     var truncatesLongNames: Bool { false }
     var maximumFileSizeInBits: Int { 64 }
+    var maximumXattrSize: Int { Int(FNTFS_MAX_XATTR_SIZE) }
 }
 
 // MARK: - Core operations
 
 extension NTFSVolume: FSVolume.Operations {
 
+    @available(macOS 26.4, *)
+    var requestedMountOptions: FSVolume.MountOptions {
+        operationLock.lock(); defer { operationLock.unlock() }
+        return readOnly || vol.map({ fntfs_is_readonly($0) }) != false ? .readOnly : []
+    }
+
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
         caps.supportsHardLinks = true
-        caps.supportsSymbolicLinks = false
+        caps.supportsSymbolicLinks = true
         caps.supportsJournal = true
         caps.supportsActiveJournal = false
         caps.supportsSparseFiles = true
@@ -227,6 +337,7 @@ extension NTFSVolume: FSVolume.Operations {
     }
 
     var volumeStatistics: FSStatFSResult {
+        operationLock.lock(); defer { operationLock.unlock() }
         // Must equal the Info.plist FSShortName ("mntfs"). "ntfs" is reserved
         // by Apple's system NTFS plugin and gets our module rejected.
         let res = FSStatFSResult(fileSystemTypeName: "mntfs")
@@ -247,6 +358,7 @@ extension NTFSVolume: FSVolume.Operations {
 
     func activate(options: FSTaskOptions,
                   replyHandler reply: @escaping (FSItem?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             _ = try requireVolume()
             let root = item(inum: fntfs_root_inum(), type: .directory)
@@ -258,6 +370,7 @@ extension NTFSVolume: FSVolume.Operations {
 
     func deactivate(options: FSDeactivateOptions = [],
                     replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         itemsLock.lock()
         items.removeAll()
         dirGeneration.removeAll()
@@ -267,17 +380,20 @@ extension NTFSVolume: FSVolume.Operations {
 
     func mount(options: FSTaskOptions,
                replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         reply(nil)
     }
 
     func unmount(replyHandler reply: @escaping () -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         shutdownVolume()
         reply()
     }
 
     func synchronize(flags: FSSyncFlags,
                      replyHandler reply: @escaping (Error?) -> Void) {
-        guard let v = vol else { reply(nil); return }
+        operationLock.lock(); defer { operationLock.unlock() }
+        guard let v = vol else { reply(posixError(shutdownError == 0 ? ENXIO : -shutdownError)); return }
         let err = fntfs_sync(v)
         reply(err == 0 ? nil : posixError(-err))
     }
@@ -285,6 +401,7 @@ extension NTFSVolume: FSVolume.Operations {
     func getAttributes(_ desiredAttributes: FSItem.GetAttributesRequest,
                        of item: FSItem,
                        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireVolume()
             let it = try requireItem(item)
@@ -300,6 +417,7 @@ extension NTFSVolume: FSVolume.Operations {
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest,
                        on item: FSItem,
                        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let it = try requireItem(item)
@@ -371,6 +489,7 @@ extension NTFSVolume: FSVolume.Operations {
 
     func lookupItem(named name: FSFileName, inDirectory directory: FSItem,
                     replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireVolume()
             let dir = try requireItem(directory)
@@ -387,6 +506,7 @@ extension NTFSVolume: FSVolume.Operations {
 
     func reclaimItem(_ item: FSItem,
                      replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         if let it = item as? NTFSItem {
             finalizeUnlink(it)   // safety net if no close arrived
             let err = forget(it)
@@ -398,13 +518,23 @@ extension NTFSVolume: FSVolume.Operations {
 
     func readSymbolicLink(_ item: FSItem,
                           replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
-        reply(nil, posixError(ENOTSUP))
+        operationLock.lock(); defer { operationLock.unlock() }
+        do {
+            let v = try requireVolume()
+            let it = try requireItem(item)
+            let data = try bridgeData { fntfs_readlink(v, it.inum, $0, $1) }
+            guard let target = String(data: data, encoding: .utf8), !target.contains("\0") else {
+                throw posixError(EILSEQ)
+            }
+            reply(FSFileName(string: target), nil)
+        } catch { reply(nil, error) }
     }
 
     func createItem(named name: FSFileName, type: FSItem.ItemType,
                     inDirectory directory: FSItem,
                     attributes newAttributes: FSItem.SetAttributesRequest,
                     replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let dir = try requireItem(directory)
@@ -431,12 +561,27 @@ extension NTFSVolume: FSVolume.Operations {
                             attributes newAttributes: FSItem.SetAttributesRequest,
                             linkContents contents: FSFileName,
                             replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
-        reply(nil, nil, posixError(ENOTSUP))
+        operationLock.lock(); defer { operationLock.unlock() }
+        do {
+            let v = try requireWritableVolume()
+            let dir = try requireItem(directory)
+            let nm = try utf8Name(name)
+            guard let target = contents.string, !target.isEmpty, !target.contains("\0") else {
+                throw posixError(EINVAL)
+            }
+            var attrs = fntfs_attrs()
+            let err = fntfs_symlink(v, dir.inum, nm, target, &attrs)
+            guard err == 0 else { throw posixError(-err) }
+            try? applyAttributes(v, attrs.inum, isFile: false, newAttributes)
+            bumpGeneration(of: dir.inum)
+            reply(self.item(inum: attrs.inum, type: .symlink), name, nil)
+        } catch { reply(nil, nil, error) }
     }
 
     func createLink(to item: FSItem, named name: FSFileName,
                     inDirectory directory: FSItem,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let it = try requireItem(item)
@@ -462,6 +607,7 @@ extension NTFSVolume: FSVolume.Operations {
     func removeItem(_ item: FSItem, named name: FSFileName,
                     fromDirectory directory: FSItem,
                     replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let it = try requireItem(item)
@@ -509,6 +655,7 @@ extension NTFSVolume: FSVolume.Operations {
                     named sourceName: FSFileName, to destinationName: FSFileName,
                     inDirectory destinationDirectory: FSItem, overItem: FSItem?,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let it = try requireItem(item)
@@ -563,6 +710,7 @@ extension NTFSVolume: FSVolume.Operations {
                             attributes: FSItem.GetAttributesRequest?,
                             packer: FSDirectoryEntryPacker,
                             replyHandler reply: @escaping (FSDirectoryVerifier, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireVolume()
             let dir = try requireItem(directory)
@@ -614,8 +762,7 @@ extension NTFSVolume: FSVolume.Operations {
                     _ = req
                     attrs = NTFSVolume.fsAttributes(a)
                 }
-                let type: FSItem.ItemType =
-                    (Int(ctype) == FNTFS_TYPE_DIR) ? .directory : .file
+                let type = NTFSVolume.itemType(ctype)
                 let ok = ctx.packer.packEntry(
                     name: FSFileName(string: name),
                     itemType: type,
@@ -645,6 +792,7 @@ extension NTFSVolume: FSVolume.OpenCloseOperations {
 
     func openItem(_ item: FSItem, modes: FSVolume.OpenModes,
                   replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         guard let it = item as? NTFSItem else {
             reply(posixError(EINVAL))
             return
@@ -657,6 +805,7 @@ extension NTFSVolume: FSVolume.OpenCloseOperations {
 
     func closeItem(_ item: FSItem, modes: FSVolume.OpenModes,
                    replyHandler reply: @escaping (Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         guard let it = item as? NTFSItem else {
             reply(posixError(EINVAL))
             return
@@ -680,6 +829,7 @@ extension NTFSVolume: FSVolume.ReadWriteOperations {
     func read(from item: FSItem, at offset: off_t, length: Int,
               into buffer: FSMutableFileDataBuffer,
               replyHandler reply: @escaping (Int, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireVolume()
             let it = try requireItem(item)
@@ -700,6 +850,7 @@ extension NTFSVolume: FSVolume.ReadWriteOperations {
 
     func write(contents: Data, to item: FSItem, at offset: off_t,
                replyHandler reply: @escaping (Int, Error?) -> Void) {
+        operationLock.lock(); defer { operationLock.unlock() }
         do {
             let v = try requireWritableVolume()
             let it = try requireItem(item)

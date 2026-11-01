@@ -24,6 +24,37 @@ make_image() {
     "$MKNTFS" -Q -F -L Regression "$1" > "$TASK_TMP/mkntfs.log" 2>&1
 }
 
+compile_c tests/test_mount_policy.c Sources/FSModule/Bridge/fntfs.c \
+    -o "$TASK_TMP/test_mount_policy"
+for state in dirty hibernate journal v2journal; do
+    make_image "$TASK_TMP/$state.img"
+    "$TASK_TMP/test_mount_policy" "$TASK_TMP/$state.img" "$state"
+done
+
+compile_c tests/test_durability.c Sources/FSModule/Bridge/fntfs.c \
+    -o "$TASK_TMP/test_durability"
+make_image "$TASK_TMP/durability.img"
+"$TASK_TMP/test_durability" "$TASK_TMP/durability.img"
+
+compile_c tests/test_error_latch.c Sources/FSModule/Bridge/fntfs.c \
+    -o "$TASK_TMP/test_error_latch"
+for state in write short-write read flush; do
+    make_image "$TASK_TMP/latch-$state.img"
+    "$TASK_TMP/test_error_latch" "$TASK_TMP/latch-$state.img" "$state"
+done
+
+compile_c tests/test_metadata.c Sources/FSModule/Bridge/fntfs.c \
+    -o "$TASK_TMP/test_metadata"
+make_image "$TASK_TMP/metadata.img"
+"$TASK_TMP/test_metadata" "$TASK_TMP/metadata.img"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    -import-objc-header Sources/FSModule/BridgingHeader.h \
+    Sources/Shared/NTFSStatus.swift Sources/FSModule/BlockDevice.swift tests/test_block_device.swift \
+    -o "$TASK_TMP/test_block_device"
+"$TASK_TMP/test_block_device"
+
 compile_c -DFNTFS_TESTING tests/test_fntfs.c Sources/FSModule/Bridge/fntfs.c \
     -o "$TASK_TMP/test_fntfs"
 make_image "$TASK_TMP/engine.img"
@@ -43,7 +74,7 @@ clang -O2 -arch arm64 -mmacosx-version-min=15.4 \
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
     -import-objc-header Sources/FSModule/BridgingHeader.h \
-    Sources/FSModule/NTFSVolume.swift Sources/FSModule/NTFSItem.swift \
+    Sources/Shared/NTFSStatus.swift Sources/FSModule/NTFSVolume.swift Sources/FSModule/NTFSItem.swift \
     Sources/FSModule/BlockDevice.swift tests/test_volume.swift \
     "$TASK_TMP/fntfs.o" "$LIB" -framework CoreFoundation -o "$TASK_TMP/test_volume"
 make_image "$TASK_TMP/volume.img"
@@ -51,11 +82,49 @@ make_image "$TASK_TMP/volume.img"
 
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    -import-objc-header Sources/FSModule/BridgingHeader.h \
+    Sources/Shared/NTFSStatus.swift Sources/FSModule/NTFSVolume.swift \
+    Sources/FSModule/NTFSItem.swift Sources/FSModule/BlockDevice.swift \
+    tests/test_fskit_metadata.swift "$TASK_TMP/fntfs.o" "$LIB" \
+    -framework CoreFoundation -o "$TASK_TMP/test_fskit_metadata"
+make_image "$TASK_TMP/fskit-metadata.img"
+"$TASK_TMP/test_fskit_metadata" "$TASK_TMP/fskit-metadata.img"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/App/DiskMountService.swift tests/test_disk_mount.swift \
+    -o "$TASK_TMP/test_disk_mount"
+"$TASK_TMP/test_disk_mount"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/App/SnapshotRefreshCoordinator.swift tests/test_snapshot_refresh.swift \
+    -o "$TASK_TMP/test_snapshot_refresh"
+"$TASK_TMP/test_snapshot_refresh"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/App/ExtensionStatus.swift tests/test_extension_status.swift \
+    -o "$TASK_TMP/test_extension_status"
+"$TASK_TMP/test_extension_status"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/Shared/NTFSStatus.swift Sources/App/ExtensionStatus.swift Sources/App/Diagnostics.swift \
+    tests/test_diagnostics.swift -o "$TASK_TMP/test_diagnostics"
+"$TASK_TMP/test_diagnostics"
+
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
+    -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/Shared/NTFSStatus.swift Sources/App/ExtensionStatus.swift Sources/App/Diagnostics.swift \
+    Sources/App/DiskMountService.swift Sources/App/SnapshotRefreshCoordinator.swift \
     Sources/App/ContentView.swift Sources/App/UpdateSafety.swift \
     tests/test_erase.swift -o "$TASK_TMP/test_erase"
 "$TASK_TMP/test_erase"
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos15.4 \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
+    Sources/Shared/NTFSStatus.swift Sources/App/ExtensionStatus.swift Sources/App/Diagnostics.swift \
+    Sources/App/DiskMountService.swift Sources/App/SnapshotRefreshCoordinator.swift \
     Sources/App/ContentView.swift Sources/App/UpdateSafety.swift \
     tests/test_label_support.swift -o "$TASK_TMP/test_label_support"
 "$TASK_TMP/test_label_support"

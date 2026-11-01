@@ -7,6 +7,8 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
+import FSKit
 
 // MARK: - Palette
 
@@ -128,7 +130,7 @@ struct CapacityRing: View {
 
 // MARK: - Model
 
-struct VolumeItem: Identifiable, Hashable {
+struct VolumeItem: Identifiable, Hashable, Sendable {
     var id: String
     var name: String
     var sizeBytes: Int64
@@ -149,12 +151,17 @@ struct VolumeItem: Identifiable, Hashable {
     /// True for the placeholder rows shown when no volumes are detected.
     /// Sample rows must never reach diskutil/mkntfs.
     var isSample: Bool = false
+    var mountedFileSystem: String = ""
+    var driverStatus: NTFSMountStatus? = nil
+    var attachmentIdentity: VolumeAttachmentIdentity? = nil
 
     var mounted: Bool { mountPoint != nil }
     var displayName: String { name.isEmpty ? "Untitled" : name }
     var sizeText: String { ByteCount.string(sizeBytes) }
     var usedFraction: Double { sizeBytes > 0 ? Double(usedBytes) / Double(sizeBytes) : 0 }
     var readOnly: Bool { !writable }
+    var accessVerified: Bool { mountedFileSystem != "mntfs" || driverStatus != nil }
+    var accessText: String { accessVerified ? (readOnly ? "Read-only" : "Read & Write") : "Unverified" }
 
     /// `isNTFS` is derived from the real mounted filesystem type (see
     /// `enumerate()`), so it stays correct even though diskutil labels our
@@ -182,19 +189,35 @@ final class VolumeStore: ObservableObject {
     @Published var selectedID: String?
     @Published var scanning = false
     @Published var usingSampleData = false
+    @Published private(set) var scanError: String?
+    @Published private(set) var busyDevices: Set<String> = []
     @Published var actionMessage: String?
-    @Published var extensionActive = true
+    let extensionMonitor = ExtensionStatusMonitor()
     @Published var verifying = false
     @Published var erasing = false
     @Published var eraseTarget: VolumeItem?
     @Published var offerLabelSupport = false
+    @Published var diagnosing = false
+    @Published var diagnosticReport: DiagnosticReport?
 
     /// Last time we tried to convert each device from Apple's read-only mount
     /// (throttle, so a cold/disabled extension can't send us into a tight loop),
     /// and devices currently being processed (guard against overlapping runs).
-    private var remountAttempts: [String: Date] = [:]
+    private var remountAttempts: [VolumeAttachmentIdentity: Date] = [:]
     private var remountInFlight: Set<String> = []
     private var diskOperations = 0
+    private let diskMountService = DiskMountService()
+    private var liveStatusInFlight = false
+    private lazy var refreshCoordinator = SnapshotRefreshCoordinator<[VolumeItem]>(
+        load: { try await Task.detached(priority: .userInitiated) { try Self.enumerate() }.value },
+        apply: { [weak self] result in
+            guard let self else { return }
+            self.scanning = false
+            switch result {
+            case .success(let volumes): self.scanError = nil; self.apply(volumes)
+            case .failure(let error): self.scanError = error.localizedDescription
+            }
+        })
     var updatePreparationInProgress = false
 
     func updateSafetySnapshot() -> UpdateSafetySnapshot {
@@ -215,11 +238,30 @@ final class VolumeStore: ObservableObject {
 
     var selected: VolumeItem? { (ntfs + others).first { $0.id == selectedID } }
 
-    init() {
+    func diagnose() {
+        guard !diagnosing else { return }
+        diagnosing = true
+        let snapshot = ntfs.filter { !$0.isSample }
+        Task {
+            await refreshExtension()
+            let state = extensionMonitor.state
+            let report = await Task.detached(priority: .utility) {
+                let volumes = snapshot.enumerated().map { index, volume in
+                    DiagnosticVolume(index: index + 1, mounted: volume.mounted,
+                        readOnly: volume.readOnly, filesystem: volume.mountedFileSystem,
+                        module: volume.mountPoint.flatMap { MountStatusReader.read(at: $0, device: volume.device) })
+                }
+                return Diagnostics.collect(volumes: volumes, extensionState: state)
+            }.value
+            diagnosticReport = report
+            diagnosing = false
+        }
+    }
+
+    init(startMonitoring: Bool = true) {
+        guard startMonitoring else { return }
         refresh()
-        checkExtension()
         maybeOfferLabelSupport()
-        autoRemountReadOnlyNTFS()   // fix drives Apple mounted read-only at boot
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: .init("NSWorkspaceDidMountNotification"),
                        object: nil, queue: .main) { [weak self] _ in
@@ -250,32 +292,63 @@ final class VolumeStore: ObservableObject {
     func refresh() {
         scanning = true
         checkExtension()
-        Task.detached(priority: .userInitiated) {
-            let all = Self.enumerate()
-            await MainActor.run { self.apply(all) }
+        refreshCoordinator.request()
+    }
+
+    /// Poll only the driver's small live xattr; a full diskutil scan is not
+    /// needed to notice a write-error latch on an already mounted volume.
+    func refreshLiveStatus() {
+        guard !liveStatusInFlight else { return }
+        let snapshot = ntfs.filter { !$0.isSample && $0.mountedFileSystem == "mntfs" && $0.mounted }
+        guard !snapshot.isEmpty else { return }
+        liveStatusInFlight = true
+        Task {
+            let updated = await Task.detached(priority: .utility) {
+                snapshot.map { volume -> VolumeItem in
+                    var copy = volume
+                    let current = NativeDiskMountBackend.readIdentity(device: volume.device)
+                    let same = volume.attachmentIdentity.map { expected in current.map(expected.matches) ?? false } ?? false
+                    copy.driverStatus = same ? volume.mountPoint.flatMap {
+                        MountStatusReader.read(at: $0, device: volume.device)
+                    } : nil
+                    let kernelWritable = volume.mountPoint.flatMap { Self.mountDetails($0) }.map { !$0.readOnly } ?? false
+                    copy.writable = kernelWritable && copy.driverStatus?.readOnly == false
+                    return copy
+                }
+            }.value
+            for volume in updated {
+                guard let index = ntfs.firstIndex(where: {
+                    $0.id == volume.id && $0.attachmentIdentity == volume.attachmentIdentity &&
+                    $0.mountPoint == volume.mountPoint && $0.mountedFileSystem == "mntfs"
+                }) else { continue }
+                if ntfs[index].driverStatus != volume.driverStatus || ntfs[index].writable != volume.writable {
+                    ntfs[index].driverStatus = volume.driverStatus
+                    ntfs[index].writable = volume.writable
+                }
+            }
+            liveStatusInFlight = false
         }
     }
 
     func checkExtension() {
-        Task.detached(priority: .utility) {
-            // Definitive "working": a volume mounted writable by our driver.
-            let working = Self.hasMntfsMount()
-            // Show "not enabled" only when there's an NTFS volume that Apple's
-            // read-only handler grabbed (our driver didn't claim it → the
-            // toggle is off). With no such drive there's nothing to warn about,
-            // so treat as active. pluginkit's "+" flag is unreliable (stays set
-            // after the toggle is turned off), so we don't consult it.
-            let active = working || Self.readOnlyAppleNTFSDevices().isEmpty
-            await MainActor.run {
-                self.extensionActive = active
-                // Only a real writable mount proves setup is complete — stop
-                // auto-showing the setup window at login once we've seen one.
-                if working { UserDefaults.standard.set(true, forKey: "setupComplete") }
-            }
+        Task { [weak self] in
+            await self?.refreshExtension()
+        }
+    }
+
+    private func refreshExtension() async {
+        let wasEnabled = extensionMonitor.state.isEnabled
+        guard await extensionMonitor.refresh() else { return }
+        if Self.hasMntfsMount() {
+            UserDefaults.standard.set(true, forKey: "setupComplete")
+        }
+        if extensionMonitor.state.isEnabled && !wasEnabled {
+            autoRemountReadOnlyNTFS(force: true)
         }
     }
 
     func openExtensionSettings() {
+        if #available(macOS 27.0, *), FSClient.shared.openFileSystemExtensionsSettings() { return }
         let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule")!
         NSWorkspace.shared.open(url)
     }
@@ -345,7 +418,7 @@ final class VolumeStore: ObservableObject {
             // so already-mounted NTFS drives keep the old "ExFAT"/"Unknown" label
             // until remounted. Remount them once so the new name shows immediately.
             if result.ok {
-                Self.remountNTFSVolumes()
+                await self.remountNTFSVolumes()
             } else {
                 NSLog("MNtfs: NTFS name support installation failed (%d): %@",
                       result.status, result.text)
@@ -386,21 +459,16 @@ final class VolumeStore: ObservableObject {
     /// Remount every volume our driver has mounted ("mntfs"), so Finder and
     /// Disk Utility re-read the (now installed) display name. Best-effort:
     /// a busy volume that won't unmount is simply left as-is.
-    nonisolated private static func remountNTFSVolumes() {
-        var devs: [String] = []
-        for fs in mountTable() {
-            guard cStr16(fs.f_fstypename) == "mntfs" else { continue }
-            devs.append(cStr16(fs.f_mntfromname))
-        }
-        for dev in devs {
-            // Plain (non-force) unmount: it fails if the volume is busy, so an
-            // in-progress copy is never interrupted — we just skip it.
-            let r = run(["unmount", dev])
-            if r.ok {
-                _ = run(["mount", dev])
-            } else {
-                NSLog("MNtfs: skip remount of busy %@ (%@)", dev, r.text)
-            }
+    private func remountNTFSVolumes() async {
+        for fs in Self.mountTable() {
+            guard Self.cStr16(fs.f_fstypename) == "mntfs" else { continue }
+            let device = Self.cStr16(fs.f_mntfromname)
+            guard !busyDevices.contains(device), !remountInFlight.contains(device),
+                  let identity = NativeDiskMountBackend.readIdentity(device: device) else { continue }
+            busyDevices.insert(device)
+            do { try await diskMountService.remount(identity) }
+            catch { NSLog("MNtfs: name refresh remount failed: %@", error.localizedDescription) }
+            busyDevices.remove(device)
         }
     }
 
@@ -465,8 +533,8 @@ final class VolumeStore: ObservableObject {
     }
 
     private func apply(_ all: [VolumeItem]) {
-        usingSampleData = all.isEmpty
-        let items = all.isEmpty ? Self.sample() : all
+        usingSampleData = false
+        let items = all
         ntfs = items.filter { $0.isNTFS }
         others = items.filter { !$0.isNTFS }
         if selectedID == nil || !items.contains(where: { $0.id == selectedID }) {
@@ -498,6 +566,11 @@ final class VolumeStore: ObservableObject {
         return RunResult(status: p.terminationStatus, out: d)
     }
 
+    nonisolated private static func readOnlyDiskutil(_ args: [String]) -> RunResult {
+        let result = DiagnosticCommand.run("/usr/sbin/diskutil", args, timeout: 15, outputLimit: 1 << 20)
+        return RunResult(status: result.status ?? -1, out: result.output)
+    }
+
     nonisolated private static func plist(_ r: RunResult) -> [String: Any]? {
         guard r.ok, !r.out.isEmpty else { return nil }
         return (try? PropertyListSerialization.propertyList(from: r.out, options: [], format: nil))
@@ -517,69 +590,47 @@ final class VolumeStore: ObservableObject {
                 s.f_flags & UInt32(MNT_DONTBROWSE) != 0)
     }
 
-    /// True if any NTFS volume is mounted READ/WRITE. Only our FSKit driver
-    /// mounts NTFS writable (Apple's built-in handler is read-only), so a
-    /// writable "ntfs" mount is a definitive sign the extension is working now.
+    /// A real "mntfs" mount proves the extension is active even when the
+    /// safety policy intentionally kept the drive read-only.
     nonisolated static func hasMntfsMount() -> Bool {
         for fs in mountTable() {
             let t = cStr16(fs.f_fstypename)
-            let readOnly = (fs.f_flags & UInt32(MNT_RDONLY)) != 0
-            if (t == "ntfs" || t == "mntfs") && !readOnly { return true }
+            if t == "mntfs" { return true }
         }
         return false
     }
 
     /// After boot (or if Apple's handler wins the race), an NTFS drive that was
-    /// already connected mounts read-only as "ntfs". Our driver never mounts
-    /// read-only, so any read-only "ntfs" volume is Apple's — unmount and remount
-    /// it once so DiskArbitration re-probes and our writable "mntfs" driver
+    /// already connected mounts read-only as "ntfs". Our driver uses "mntfs",
+    /// including for safety read-only mounts — unmount and remount Apple's volume
+    /// once so DiskArbitration re-probes and our writable "mntfs" driver
     /// (probe order 500, ahead of Apple's 1000) claims it. This is what makes
     /// drives writable right after login without a manual replug.
     /// - Parameter force: bypass the per-device throttle (used when the user
     ///   returns from System Settings, where a prompt retry is expected).
-    /// We deliberately do NOT gate on `extensionEnabled()`: that check is
-    /// unreliable right after the toggle flips, so instead we just attempt the
-    /// remount — if the extension isn't ready the volume stays read-only and a
-    /// later trigger retries; if it is, our writable driver takes over.
+    /// Only attempt a takeover after FSKit confirms this module is enabled.
+    /// The enablement check schedules a retry when Settings changes take effect.
     func autoRemountReadOnlyNTFS(force: Bool = false) {
-        guard !updatePreparationInProgress else { return }
-        Task.detached(priority: .utility) {
-            let devs = Self.readOnlyAppleNTFSDevices()
-            guard !devs.isEmpty else { return }
-            let now = Date()
-            let todo: [String] = await MainActor.run {
-                guard !self.updatePreparationInProgress else { return [] }
-                return devs.filter { dev in
-                    if self.remountInFlight.contains(dev) { return false }
-                    if !force, let last = self.remountAttempts[dev],
-                       now.timeIntervalSince(last) < 8 { return false }
-                    self.remountAttempts[dev] = now
-                    self.remountInFlight.insert(dev)
-                    return true
-                }
+        guard extensionMonitor.state.isEnabled, !updatePreparationInProgress else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let identities = await Task.detached(priority: .utility) {
+                Self.readOnlyAppleNTFSDevices().compactMap { NativeDiskMountBackend.readIdentity(device: $0) }
+            }.value
+            for identity in identities {
+                guard extensionMonitor.state.isEnabled, !updatePreparationInProgress else { break }
+                let device = identity.device
+                guard identity.writable, !remountInFlight.contains(device), !busyDevices.contains(device) else { continue }
+                if !force, let last = remountAttempts[identity], Date().timeIntervalSince(last) < 8 { continue }
+                remountAttempts[identity] = Date()
+                remountInFlight.insert(device)
+                // One non-force attempt. Never repeatedly unmount a user's drive
+                // while waiting for a cold/disabled driver to become ready.
+                do { try await diskMountService.remount(identity, requireWritable: true) }
+                catch { NSLog("MNtfs: automatic remount failed: %@", error.localizedDescription) }
+                remountInFlight.remove(device)
             }
-            guard !todo.isEmpty else { return }
-            for dev in todo {
-                NSLog("MNtfs: auto-remount read-only NTFS %@", dev)
-                // Right after login/enable the extension may still be warming up,
-                // so the first remount can come back read-only — retry a few times.
-                for _ in 0..<3 {
-                    // Plain unmount: fails (and we stop) if the volume is busy,
-                    // so we never yank a drive out from under an in-progress read.
-                    let r = Self.run(["unmount", dev])
-                    guard r.ok else {
-                        NSLog("MNtfs: leave busy %@ as-is (%@)", dev, r.text)
-                        break
-                    }
-                    _ = Self.run(["mount", dev])
-                    try? await Task.sleep(nanoseconds: 1_200_000_000)
-                    if !Self.readOnlyAppleNTFSDevices().contains(dev) { break }
-                }
-            }
-            await MainActor.run {
-                todo.forEach { self.remountInFlight.remove($0) }
-                self.refresh()
-            }
+            if !identities.isEmpty { refresh() }
         }
     }
 
@@ -596,9 +647,12 @@ final class VolumeStore: ObservableObject {
         return out
     }
 
-    nonisolated private static func enumerate() -> [VolumeItem] {
-        guard let list = plist(run(["list", "-plist"])),
-              let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
+    nonisolated private static func enumerate() throws -> [VolumeItem] {
+        guard let list = plist(readOnlyDiskutil(["list", "-plist"])),
+              let disks = list["AllDisksAndPartitions"] as? [[String: Any]] else {
+            throw NSError(domain: "com.fastntfs.scan", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "Could not read the drive list. The last known volumes are still shown; refresh to try again."])
+        }
         var ids: [String] = []
         for disk in disks {
             // Partitionless NTFS media has no Partitions/APFSVolumes array.
@@ -615,7 +669,7 @@ final class VolumeStore: ObservableObject {
         }
         var items: [VolumeItem] = []
         for id in ids {
-            guard let info = plist(run(["info", "-plist", id])) else { continue }
+            guard let info = plist(readOnlyDiskutil(["info", "-plist", id])) else { continue }
             let name = (info["VolumeName"] as? String) ?? ""
             let size = (info["Size"] as? NSNumber)?.int64Value
                 ?? (info["TotalSize"] as? NSNumber)?.int64Value ?? 0
@@ -633,8 +687,10 @@ final class VolumeStore: ObservableObject {
             // driver mounts as "mntfs", Apple's read-only handler as "ntfs".
             let details = mount.flatMap { Self.mountDetails($0) }
             let kfs = details?.type ?? ""
-            let writable = details.map { !$0.readOnly }
+            let driverStatus = kfs == "mntfs" ? mount.flatMap { MountStatusReader.read(at: $0, device: dev) } : nil
+            let kernelWritable = details.map { !$0.readOnly }
                 ?? (info["WritableVolume"] as? NSNumber)?.boolValue ?? true
+            let writable = kernelWritable && (kfs != "mntfs" || driverStatus?.readOnly == false)
             let isNTFS: Bool
             if kfs == "mntfs" || kfs == "ntfs" {
                 isNTFS = true
@@ -666,7 +722,9 @@ final class VolumeStore: ObservableObject {
                 ejectable: ejectable, isNTFS: isNTFS, nobrowse: nobrowse,
                 usedBytes: used, freeBytes: free,
                 volumeUUID: info["VolumeUUID"] as? String,
-                diskUUID: info["DiskUUID"] as? String))
+                diskUUID: info["DiskUUID"] as? String,
+                mountedFileSystem: kfs, driverStatus: driverStatus,
+                attachmentIdentity: NativeDiskMountBackend.readIdentity(device: dev)))
         }
         return items
     }
@@ -674,6 +732,14 @@ final class VolumeStore: ObservableObject {
     /// True when `v` is a real volume that diskutil may act on. Sample rows
     /// (and anything without a /dev/disk path) are display-only.
     private func actionable(_ v: VolumeItem) -> Bool {
+        if scanError != nil {
+            actionMessage = "Refresh the drive list before starting another operation."
+            return false
+        }
+        if busyDevices.contains(v.device) || remountInFlight.contains(v.device) {
+            actionMessage = DiskMountError.busy.localizedDescription
+            return false
+        }
         if updatePreparationInProgress {
             actionMessage = "MNtfs is preparing an update. Try again after it restarts."
             return false
@@ -687,30 +753,35 @@ final class VolumeStore: ObservableObject {
 
     func toggleMount(_ v: VolumeItem) {
         guard actionable(v) else { return }
+        guard let identity = v.attachmentIdentity else {
+            actionMessage = DiskMountError.targetChanged.localizedDescription
+            return
+        }
         diskOperations += 1
-        let mounting = !v.mounted
-        Task.detached(priority: .userInitiated) {
-            let r = Self.run([mounting ? "mount" : "unmount", v.device])
-            await MainActor.run {
-                self.diskOperations -= 1
-                if !r.ok {   // trust the exit code, not a substring match
-                    self.actionMessage = r.text.isEmpty
-                        ? "diskutil \(mounting ? "mount" : "unmount") failed (status \(r.status))."
-                        : r.text
-                }
-                self.refresh()
-            }
+        busyDevices.insert(v.device)
+        Task {
+            do { try await diskMountService.setMounted(!v.mounted, identity: identity) }
+            catch { actionMessage = error.localizedDescription }
+            busyDevices.remove(v.device)
+            diskOperations -= 1
+            refresh()
         }
     }
 
     func verify(_ v: VolumeItem) {
         guard actionable(v) else { return }
+        guard v.mountedFileSystem != "mntfs" else {
+            actionMessage = "Unmount this NTFS drive before verifying it. Use Diagnostics to inspect a mounted drive."
+            return
+        }
         diskOperations += 1
+        busyDevices.insert(v.device)
         verifying = true
         Task.detached(priority: .userInitiated) {
             let r = Self.run(["verifyVolume", v.device])
             await MainActor.run {
                 self.diskOperations -= 1
+                self.busyDevices.remove(v.device)
                 self.verifying = false
                 self.actionMessage = r.text.isEmpty ? "No output." : r.text
             }
@@ -722,6 +793,7 @@ final class VolumeStore: ObservableObject {
     func erase(_ v: VolumeItem, newName: String) {
         guard actionable(v) else { eraseTarget = nil; return }
         diskOperations += 1
+        busyDevices.insert(v.device)
         erasing = true
         Task.detached(priority: .userInitiated) {
             let result = Self.performErase(device: v.device, name: newName,
@@ -731,6 +803,7 @@ final class VolumeStore: ObservableObject {
                                            expectedDiskUUID: v.diskUUID)
             await MainActor.run {
                 self.diskOperations -= 1
+                self.busyDevices.remove(v.device)
                 self.erasing = false
                 self.eraseTarget = nil
                 self.actionMessage = result
@@ -875,6 +948,13 @@ final class VolumeStore: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    static func preview() -> VolumeStore {
+        let store = VolumeStore(startMonitoring: false)
+        store.apply(Self.sample())
+        store.usingSampleData = true
+        return store
+    }
+
     /// Placeholder rows for the empty state. No real device paths: every row
     /// is flagged `isSample` and carries an empty `device`, so nothing here
     /// can ever be passed to diskutil or mkntfs.
@@ -992,6 +1072,45 @@ private struct VolumeRow: View {
     }
 }
 
+private struct ExtensionStatusView: View {
+    @ObservedObject var monitor: ExtensionStatusMonitor
+    var openSettings: () -> Void
+
+    var body: some View {
+        if monitor.state == .enabled || monitor.state == .checking {
+            HStack(spacing: 8) {
+                Circle().fill(monitor.state.isEnabled ? UI.green : UI.faint).frame(width: 7, height: 7)
+                Text(monitor.state.title).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(UI.dim)
+                Spacer()
+            }
+            .padding(.horizontal, 16).frame(height: 46)
+            .help(monitor.state.detail)
+        } else {
+            Button(action: openSettings) {
+                HStack(spacing: 9) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12)).foregroundStyle(UI.amber)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(monitor.state.title)
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(UI.text)
+                        Text("Click to check System Settings")
+                            .font(.system(size: 10)).foregroundStyle(UI.faint)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(UI.faint)
+                }
+                .padding(.horizontal, 14).frame(height: 46)
+                .background(UI.amber.opacity(0.13))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(monitor.state.detail)
+        }
+    }
+}
+
 private struct Sidebar: View {
     @ObservedObject var store: VolumeStore
     var body: some View {
@@ -1033,6 +1152,13 @@ private struct Sidebar: View {
                 .background(UI.amber.opacity(0.10))
             }
 
+            if let error = store.scanError {
+                Label("Could not refresh drives — try Refresh", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10.5)).foregroundStyle(UI.amber)
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .help(error)
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     section("NTFS Drives", store.ntfs)
@@ -1047,37 +1173,11 @@ private struct Sidebar: View {
     }
 
     @ViewBuilder private var extensionStatus: some View {
-        if store.extensionActive {
-            HStack(spacing: 8) {
-                Circle().fill(UI.green).frame(width: 7, height: 7)
-                Text("Extension active").font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(UI.dim)
-                Spacer()
+        ExtensionStatusView(monitor: store.extensionMonitor, openSettings: store.openExtensionSettings)
+            .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+                store.checkExtension()
+                store.refreshLiveStatus()
             }
-            .padding(.horizontal, 16).frame(height: 46)
-        } else {
-            Button { store.openExtensionSettings() } label: {
-                HStack(spacing: 9) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12)).foregroundStyle(UI.amber)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Extension not enabled")
-                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(UI.text)
-                        Text("NTFS disks won't mount — click to enable")
-                            .font(.system(size: 10)).foregroundStyle(UI.faint)
-                            .lineLimit(1).minimumScaleFactor(0.85)
-                    }
-                    Spacer(minLength: 4)
-                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(UI.faint)
-                }
-                .padding(.horizontal, 14).frame(height: 46)
-                .background(UI.amber.opacity(0.13))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open File System Extensions settings")
-        }
     }
 
     @ViewBuilder private func section(_ title: String, _ items: [VolumeItem]) -> some View {
@@ -1168,11 +1268,12 @@ private struct InfoRow: View {
 /// Prominent read/write pill near the volume title. No cryptic "RO" text.
 private struct AccessBadge: View {
     let readOnly: Bool
+    var verified = true
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: readOnly ? "lock.fill" : "square.and.pencil")
                 .font(.system(size: 10, weight: .bold))
-            Text(readOnly ? "Read-Only" : "Read & Write")
+            Text(verified ? (readOnly ? "Read-Only" : "Read & Write") : "Unverified")
                 .font(.system(size: 11, weight: .bold))
         }
         .foregroundStyle(readOnly ? Color(0xffb0b0) : Color(0x62e6a4))
@@ -1193,7 +1294,14 @@ private struct DetailPane: View {
                 if let v = store.selected {
                     content(v)
                 } else {
-                    VStack { Spacer(); Text("Select a volume").foregroundStyle(UI.dim); Spacer() }
+                    VStack {
+                        Spacer()
+                        Text(store.scanning ? "Scanning volumes…" :
+                            store.scanError != nil ? "Could not refresh volumes. Try Refresh." :
+                            "No volumes found. Connect a drive to get started.")
+                            .foregroundStyle(UI.dim)
+                        Spacer()
+                    }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
@@ -1216,6 +1324,10 @@ private struct DetailPane: View {
                 }
                 .font(.system(size: 11.5))
                 Spacer()
+                Button(store.diagnosing ? "Collecting…" : "Diagnostics…") { store.diagnose() }
+                    .font(.system(size: 11.5))
+                    .disabled(store.diagnosing)
+                    .padding(.trailing, 16)
                 Button { showDonate.toggle() } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "cup.and.saucer.fill").font(.system(size: 11))
@@ -1244,13 +1356,13 @@ private struct DetailPane: View {
                     HStack(spacing: 9) {
                         Text(v.formatDisplay)
                             .font(.system(size: 12.5, weight: .medium)).foregroundStyle(UI.dim)
-                        AccessBadge(readOnly: v.readOnly)
+                        AccessBadge(readOnly: v.readOnly, verified: v.accessVerified)
                     }
                 }
                 Spacer()
                 HStack(spacing: 9) {
                     // Sample rows are display-only: no diskutil action may run.
-                    let sampleOnly = v.isSample || store.usingSampleData
+                    let sampleOnly = v.isSample || store.usingSampleData || store.busyDevices.contains(v.device)
                     // The boot volume at "/" can't be unmounted; hide the control.
                     if v.mountPoint != "/" {
                         PillButton(icon: v.mounted ? "eject.fill" : "arrow.down.circle.fill",
@@ -1280,6 +1392,14 @@ private struct DetailPane: View {
             .overlay(alignment: .bottom) { Rectangle().fill(UI.line).frame(height: 1) }
 
             // hero: capacity ring + info
+            if v.isNTFS && v.mounted && v.readOnly {
+                Label(v.driverStatus?.readOnlyExplanation ?? "This drive is read-only. The reason has not been verified. Check write protection and the requested mount mode. If Windows used hibernation or Fast Startup, resume Windows and shut down fully; use chkdsk /f on Windows if repair is needed.",
+                      systemImage: "lock.shield")
+                    .font(.system(size: 12))
+                    .foregroundStyle(UI.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 34).padding(.top, 16)
+            }
             HStack(alignment: .top, spacing: 44) {
                 VStack(spacing: 14) {
                     CapacityRing(fraction: v.usedFraction, size: 168, volume: v)
@@ -1295,7 +1415,7 @@ private struct DetailPane: View {
                     InfoRow(k: "Status", v: v.mounted ? "Mounted" : "Not mounted", good: v.mounted)
                     InfoRow(k: "Device", v: v.device.isEmpty ? "—" : v.device)
                     InfoRow(k: "Format", v: v.formatDisplay)
-                    InfoRow(k: "Access", v: v.readOnly ? "Read-only" : "Read & Write",
+                    InfoRow(k: "Access", v: v.accessText,
                             access: v.readOnly ? .ro : .rw)
                     InfoRow(k: "Location", v: v.mountPoint ?? "—", link: v.mounted)
                     capacityLegend(v).padding(.top, 16)
@@ -1396,6 +1516,59 @@ struct ContentView: View {
                        onErase: { store.erase(target, newName: $0) },
                        onCancel: { store.eraseTarget = nil })
         }
+        .sheet(item: $store.diagnosticReport) { report in
+            DiagnosticsSheet(report: report)
+        }
+    }
+}
+
+private struct DiagnosticsDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    let data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents else { throw CocoaError(.fileReadCorruptFile) }
+        self.data = data
+    }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
+private struct DiagnosticsSheet: View {
+    let report: DiagnosticReport
+    @Environment(\.dismiss) private var dismiss
+    @State private var exporting = false
+    @State private var exportError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("MNtfs Diagnostics").font(.title2.bold())
+            Text("Collected locally. Drive names, paths and device identifiers are omitted.")
+                .font(.callout).foregroundStyle(.secondary)
+            ScrollView {
+                Text(report.text).font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack {
+                Button("Copy Report") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(String(decoding: report.json, as: UTF8.self), forType: .string)
+                }
+                Button("Save JSON…") { exporting = true }
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24).frame(width: 700, height: 500)
+        .fileExporter(isPresented: $exporting, document: DiagnosticsDocument(data: report.json),
+                      contentType: .json, defaultFilename: "MNtfs-diagnostics") { result in
+            if case let .failure(error) = result { exportError = error.localizedDescription }
+        }
+        .alert("Could not save diagnostics", isPresented: Binding(
+            get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
+            Button("OK", role: .cancel) { exportError = nil }
+        } message: { Text(exportError ?? "") }
     }
 }
 
@@ -1483,4 +1656,4 @@ private struct EraseSheet: View {
     }
 }
 
-#Preview { ContentView(store: VolumeStore()) }
+#Preview { ContentView(store: VolumeStore.preview()) }

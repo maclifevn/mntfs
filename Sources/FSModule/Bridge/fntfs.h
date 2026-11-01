@@ -31,7 +31,8 @@ typedef int64_t (*fntfs_pread_cb)(void *_Nullable ctx, void *_Nonnull buf,
                                   int64_t count, int64_t offset);
 typedef int64_t (*fntfs_pwrite_cb)(void *_Nullable ctx, const void *_Nonnull buf,
                                    int64_t count, int64_t offset);
-/* Flush device caches. Return 0 or -errno. */
+/* Synchronize the caller's backend. Return 0 or -errno; the caller must
+   document whether this includes a hardware-cache flush. */
 typedef int (*fntfs_flush_cb)(void *_Nullable ctx);
 
 enum {
@@ -39,6 +40,7 @@ enum {
     FNTFS_TYPE_FILE    = 1,
     FNTFS_TYPE_DIR     = 2,
     FNTFS_TYPE_SYMLINK = 3,
+    FNTFS_TYPE_REPARSE = 4, /* opaque unsupported reparse point */
 };
 
 /* Windows file attribute bits we surface (subset of FILE_ATTR_*). */
@@ -53,6 +55,7 @@ typedef struct {
     uint64_t size;
     uint64_t alloc_size;
     uint32_t win_attrs;
+    uint32_t reparse_tag;
     int64_t  crtime_sec; int32_t crtime_nsec;   /* birth   */
     int64_t  mtime_sec;  int32_t mtime_nsec;    /* data    */
     int64_t  ctime_sec;  int32_t ctime_nsec;    /* meta    */
@@ -82,6 +85,7 @@ enum {
 #define FNTFS_VSTATE_DIRTY      (1u << 0)  /* dirty bit set in $Volume        */
 #define FNTFS_VSTATE_HIBERNATED (1u << 1)  /* valid hibernation image present */
 #define FNTFS_VSTATE_LOG_DIRTY  (1u << 2)  /* $LogFile has pending state      */
+#define FNTFS_VSTATE_UNKNOWN    (1u << 3)  /* a safety check could not finish */
 
 /*
  * Inspect an unmounted volume's consistency state without modifying anything
@@ -101,7 +105,10 @@ int fntfs_probe(void *_Nullable ctx, fntfs_pread_cb _Nonnull pread_cb,
                 char *_Nonnull name_out, uint64_t *_Nonnull serial_out);
 
 /*
- * Mount. On success returns a volume handle and fills name/serial.
+ * Mount. A requested writable mount falls back to read-only if the dirty bit,
+ * hibernation image or journal is unsafe/unknown. Never resets the journal or
+ * removes hiberfil.sys. Query the effective mode with fntfs_is_readonly.
+ * On success returns a volume handle and fills name/serial.
  * On failure returns NULL and sets *err_out to a positive errno.
  */
 fntfs_vol *_Nullable fntfs_mount(void *_Nullable ctx,
@@ -113,6 +120,12 @@ fntfs_vol *_Nullable fntfs_mount(void *_Nullable ctx,
                                  char *_Nullable name_out,
                                  uint64_t *_Nullable serial_out,
                                  int *_Nonnull err_out);
+
+bool fntfs_is_readonly(fntfs_vol *_Nonnull v);
+/* First device/writeback failure, positive errno; 0 until a failure occurs.
+   The handle rejects new mutations until unmount, even if the device recovers. */
+int fntfs_io_error(fntfs_vol *_Nonnull v);
+uint32_t fntfs_mount_state(fntfs_vol *_Nonnull v);
 
 /* Flush everything and release the volume. Returns 0 or -errno. */
 int fntfs_unmount(fntfs_vol *_Nonnull v);
@@ -156,6 +169,30 @@ int64_t fntfs_write(fntfs_vol *_Nonnull v, uint64_t inum,
 int fntfs_create(fntfs_vol *_Nonnull v, uint64_t dir,
                  const char *_Nonnull name, bool is_dir,
                  fntfs_attrs *_Nonnull out);
+
+/* POSIX symlinks are stored as WSL reparse points. Native Windows symlinks,
+   same-volume junctions and legacy Interix links are readable too. */
+int fntfs_symlink(fntfs_vol *_Nonnull v, uint64_t dir,
+                  const char *_Nonnull name, const char *_Nonnull target,
+                  fntfs_attrs *_Nonnull out);
+/* Two-pass buffer APIs: NULL/0 queries length; insufficient space -> -ERANGE. */
+int64_t fntfs_readlink(fntfs_vol *_Nonnull v, uint64_t inum,
+                       void *_Nullable buffer, size_t size);
+int64_t fntfs_get_reparse(fntfs_vol *_Nonnull v, uint64_t inum,
+                          void *_Nullable buffer, size_t size);
+
+#define FNTFS_MAX_XATTR_SIZE (16u << 20)
+enum { FNTFS_XATTR_SET = 0, FNTFS_XATTR_CREATE = 1,
+       FNTFS_XATTR_REPLACE = 2, FNTFS_XATTR_DELETE = 3 };
+/* macOS xattrs map literally to named NTFS $DATA streams. Listing returns
+   NUL-terminated UTF-8 names; streams outside macOS limits stay untouched. */
+int64_t fntfs_getxattr(fntfs_vol *_Nonnull v, uint64_t inum,
+                       const char *_Nonnull name, void *_Nullable buffer, size_t size);
+int64_t fntfs_listxattr(fntfs_vol *_Nonnull v, uint64_t inum,
+                        void *_Nullable buffer, size_t size);
+int fntfs_setxattr(fntfs_vol *_Nonnull v, uint64_t inum,
+                    const char *_Nonnull name, const void *_Nullable value,
+                    size_t size, int policy);
 
 int fntfs_remove(fntfs_vol *_Nonnull v, uint64_t dir,
                  const char *_Nonnull name, uint64_t inum);

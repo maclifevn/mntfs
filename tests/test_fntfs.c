@@ -165,6 +165,11 @@ int main(int argc, char **argv)
     g_fail_flush = true;
     CHECK(fntfs_sync(v) == -EIO, "sync must propagate device failure");
     g_fail_flush = false;
+    CHECK(fntfs_is_readonly(v) && fntfs_io_error(v) == EIO, "flush failure must latch read-only");
+    CHECK(fntfs_unmount(v) == -EIO, "unmount must retain the first flush failure");
+    v = fntfs_mount(NULL, cb_pread, cb_pwrite, cb_flush, dev_size, SECTOR,
+                    false, name, &serial, &err);
+    CHECK(v && !fntfs_is_readonly(v), "fresh mount after flush fault err=%d", err);
 
     /* --- create file, write, read back --- */
     fntfs_attrs fa;
@@ -500,10 +505,16 @@ int main(int argc, char **argv)
           "access time must persist after inode reopen");
     // Setter succeeds in memory, but inode close writes the changed metadata.
     // A close failure must be returned to the caller.
+    CHECK(fntfs_sync(v) == 0, "establish acknowledged data before metadata fault");
     g_fail_writes = 100; // Keep failing through libntfs-3g's internal retries.
     CHECK(fntfs_settimes(v, fa.inum, &tset, FNTFS_SET_ATIME) < 0,
           "settimes must propagate inode close failure");
     g_fail_writes = 0;
+    CHECK(fntfs_is_readonly(v) && fntfs_io_error(v) == EIO, "metadata writeback failure must latch");
+    CHECK(fntfs_unmount(v) == -EIO, "unmount must retain metadata writeback failure");
+    v = fntfs_mount(NULL, cb_pread, cb_pwrite, cb_flush, dev_size, SECTOR,
+                    false, name, &serial, &err);
+    CHECK(v && !fntfs_is_readonly(v), "fresh mount after metadata fault err=%d", err);
 
     /* --- winattrs --- */
     CHECK(fntfs_setwinattrs(v, fa.inum, FNTFS_WINATTR_HIDDEN) == 0, "winattrs");

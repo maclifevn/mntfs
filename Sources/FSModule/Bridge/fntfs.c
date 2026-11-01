@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@
 #include <sys/disk.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include "types.h"
 #include "device.h"
@@ -34,6 +36,7 @@
 #include "ntfstime.h"
 #include "layout.h"
 #include "logfile.h"
+#include "reparse.h"
 
 /*
  * Ghost names: temporary directory entries the bridge creates for two jobs —
@@ -81,8 +84,24 @@ typedef struct {
     uint32_t        sector;    /* alignment unit      */
     int64_t         pos;       /* for seek/read/write */
     bool            readonly;
+    int             terminal_error; /* first failed device/writeback errno */
     small_io_cache *read_cache; /* optional, protected by the volume lock */
 } fntfs_dev_ctx;
+
+static bool device_readonly(const fntfs_dev_ctx *c)
+{
+    return c->readonly || c->terminal_error;
+}
+
+/* Once writeback becomes uncertain, never resume writes on this handle.
+   This also gates libntfs-3g's internal rollback/close writes. Keep the first
+   failure distinct from a requested RO mount so sync cannot report success. */
+static void device_fail(fntfs_dev_ctx *c, int error)
+{
+    if (c->readonly || c->terminal_error) return;
+    c->terminal_error = error > 0 ? error : EIO;
+    if (c->read_cache) memset(c->read_cache, 0, sizeof(*c->read_cache));
+}
 
 static void small_io_store(small_io_cache *cache, const void *buf,
                             int64_t count, int64_t offset)
@@ -107,7 +126,7 @@ static void small_io_store(small_io_cache *cache, const void *buf,
 static int64_t device_read(fntfs_dev_ctx *c, void *buf, int64_t count,
                             int64_t offset)
 {
-    if (c->read_cache && count <= SMALL_IO_SIZE) {
+    if (!c->terminal_error && c->read_cache && count <= SMALL_IO_SIZE) {
         for (int i = 0; i < SMALL_IO_SLOTS; i++) {
             small_io_entry *e = &c->read_cache->entries[i];
             if (e->length == count && e->offset == offset) {
@@ -118,13 +137,18 @@ static int64_t device_read(fntfs_dev_ctx *c, void *buf, int64_t count,
         }
     }
     int64_t r = c->pread_cb(c->swift_ctx, buf, count, offset);
-    if (r == count) small_io_store(c->read_cache, buf, count, offset);
+    if (r > count) r = -EIO;
+    if (r == -EIO || r == -ENXIO || r == -ENODEV || (r >= 0 && r != count))
+        device_fail(c, r < 0 ? (int)-r : EIO);
+    if (r == count && !c->terminal_error) small_io_store(c->read_cache, buf, count, offset);
     return r;
 }
 
 static int64_t device_write(fntfs_dev_ctx *c, const void *buf, int64_t count,
                              int64_t offset)
 {
+    if (c->terminal_error) return -c->terminal_error;
+    if (c->readonly || !c->pwrite_cb) return -EROFS;
     if (c->read_cache) {
         for (int i = 0; i < SMALL_IO_SLOTS; i++) {
             small_io_entry *e = &c->read_cache->entries[i];
@@ -134,7 +158,9 @@ static int64_t device_write(fntfs_dev_ctx *c, const void *buf, int64_t count,
         }
     }
     int64_t w = c->pwrite_cb(c->swift_ctx, buf, count, offset);
-    if (w == count) small_io_store(c->read_cache, buf, count, offset);
+    if (w > count) w = -EIO;
+    if (w != count) device_fail(c, w < 0 && w >= -INT_MAX ? (int)-w : EIO);
+    if (w == count && !c->terminal_error) small_io_store(c->read_cache, buf, count, offset);
     return w;
 }
 
@@ -192,7 +218,7 @@ static int64_t dev_pread_aligned(fntfs_dev_ctx *c, void *buf, int64_t count,
 static int64_t dev_pwrite_aligned(fntfs_dev_ctx *c, const void *buf,
                                   int64_t count, int64_t offset)
 {
-    if (c->readonly || !c->pwrite_cb) return -EROFS;
+    if (device_readonly(c) || !c->pwrite_cb) return -EROFS;
     if (offset < 0 || count < 0) return -EINVAL;
     if (offset >= c->size || count > c->size - offset) return -EIO;  /* overflow-safe */
     if (count == 0) return 0;
@@ -325,9 +351,14 @@ static s64 fdev_write(struct ntfs_device *dev, const void *buf, s64 count)
 static int fdev_sync(struct ntfs_device *dev)
 {
     fntfs_dev_ctx *c = dev->d_private;
-    if (c->flush_cb) {
-        int r = c->flush_cb(c->swift_ctx);
-        if (r < 0) { errno = -r; return -1; }
+    if (c->terminal_error) { errno = c->terminal_error; return -1; }
+    if (c->readonly) return 0;
+    if (!c->flush_cb) { device_fail(c, ENOTSUP); errno = ENOTSUP; return -1; }
+    int r = c->flush_cb(c->swift_ctx);
+    if (r) {
+        device_fail(c, r < 0 && r != INT_MIN ? -r : EIO);
+        errno = c->terminal_error;
+        return -1;
     }
     NDevClearDirty(dev);
     return 0;
@@ -389,6 +420,7 @@ struct fntfs_vol {
     pthread_mutex_t    lock;
     fcache_ent         cache[FCACHE_SIZE];
     uint64_t           clock;
+    uint32_t           mount_state;
 };
 
 #define LOCK(v)   pthread_mutex_lock(&(v)->lock)
@@ -435,16 +467,17 @@ uint64_t fntfs_root_inum(void) { return FILE_root; }
 /* Returns 0, or -errno if the entry's dirty state failed to reach the disk.
    The slot is emptied either way (the handles are gone), but the caller must
    surface the error instead of silently losing data. */
-static int fcache_drop_ent(fcache_ent *e)
+static int fcache_drop_ent(fntfs_vol *v, fcache_ent *e)
 {
     if (!e->inum) return 0;
     int err = 0;
     if (e->ni && ntfs_inode_sync(e->ni))
-        err = -errno;
+        err = -(errno ? errno : EIO);
     if (e->na) ntfs_attr_close(e->na);
     if (e->ni && ntfs_inode_close(e->ni) && !err)
-        err = -errno;
+        err = -(errno ? errno : EIO);
     e->inum = 0; e->ni = NULL; e->na = NULL;
+    if (err) device_fail(&v->devctx, -err);
     return err;
 }
 
@@ -453,7 +486,7 @@ static int fcache_drop(fntfs_vol *v, uint64_t inum)
     int err = 0;
     for (int i = 0; i < FCACHE_SIZE; i++)
         if (v->cache[i].inum == inum) {
-            int r = fcache_drop_ent(&v->cache[i]);
+            int r = fcache_drop_ent(v, &v->cache[i]);
             if (r && !err) err = r;
         }
     return err;
@@ -463,7 +496,7 @@ static int fcache_drop_all(fntfs_vol *v)
 {
     int err = 0;
     for (int i = 0; i < FCACHE_SIZE; i++) {
-        int r = fcache_drop_ent(&v->cache[i]);
+        int r = fcache_drop_ent(v, &v->cache[i]);
         if (r && !err) err = r;
     }
     return err;
@@ -483,6 +516,10 @@ static int fcache_get(fntfs_vol *v, uint64_t inum, ntfs_inode **nip,
     }
     ntfs_inode *ni = ntfs_inode_open(v->vol, MK_MREF(inum, 0));
     if (!ni) return -errno;
+    if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+        ntfs_inode_close(ni);
+        return -ENOTSUP;
+    }
     ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
     if (!na) {
         int e = errno;
@@ -496,7 +533,7 @@ static int fcache_get(fntfs_vol *v, uint64_t inum, ntfs_inode **nip,
         if (!v->cache[i].inum) { victim = i; break; }
         if (v->cache[i].stamp < v->cache[victim].stamp) victim = i;
     }
-    int derr = fcache_drop_ent(&v->cache[victim]);
+    int derr = fcache_drop_ent(v, &v->cache[victim]);
     if (derr) {
         ntfs_attr_close(na);
         ntfs_inode_close(ni);
@@ -541,16 +578,35 @@ static void set_ts(int64_t *sec, int32_t *nsec, ntfs_time t)
     *nsec = (int32_t)ts.tv_nsec;
 }
 
+static char *symlink_target(ntfs_inode *ni);
+
 static void fill_attrs(ntfs_inode *ni, fntfs_attrs *out)
 {
     memset(out, 0, sizeof(*out));
     out->inum = ni->mft_no;
     bool isdir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
     out->type = isdir ? FNTFS_TYPE_DIR : FNTFS_TYPE_FILE;
+    if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+        out->type = ntfs_possible_symlink(ni) ? FNTFS_TYPE_SYMLINK : FNTFS_TYPE_REPARSE;
+        REPARSE_POINT header;
+        ntfs_attr *na = ntfs_attr_open(ni, AT_REPARSE_POINT, AT_UNNAMED, 0);
+        if (na) {
+            if (ntfs_attr_pread(na, 0, sizeof(header), &header) == sizeof(header))
+                out->reparse_tag = le32_to_cpu(header.reparse_tag);
+            ntfs_attr_close(na);
+        }
+    } else if (!isdir && (ni->flags & FILE_ATTR_SYSTEM) &&
+               ntfs_interix_types(ni) == NTFS_DT_LNK) {
+        out->type = FNTFS_TYPE_SYMLINK;
+    }
     out->nlink = le16_to_cpu(ni->mrec->link_count);
     if (!isdir) {
         out->size = (uint64_t)ni->data_size;
         out->alloc_size = (uint64_t)ni->allocated_size;
+    }
+    if (out->type == FNTFS_TYPE_SYMLINK) {
+        char *target = symlink_target(ni);
+        if (target) { out->size = strlen(target); free(target); }
     }
     uint32_t fl = le32_to_cpu(ni->flags);
     if (fl & 0x0001) out->win_attrs |= FNTFS_WINATTR_READONLY;
@@ -570,53 +626,6 @@ static void ghost_name(char *out, size_t cap, const char *prefix,
     static unsigned long seq;   /* under the volume lock in every caller */
     snprintf(out, cap, "%s%08lx-%llx", prefix, ++seq,
              (unsigned long long)inum);
-}
-
-/*
- * The mount ignored hiberfil.sys (Fast Startup / hibernation image). Writing
- * while a valid image survives would let Windows resume from stale metadata
- * and corrupt everything we changed, so on a read-write mount the image is
- * deleted — the same policy as ntfs-3g's `remove_hiberfile` option. Windows
- * then simply performs a full boot next time.
- *
- * Returns 0 only when it is safe to write (no image, invalid image, or the
- * image was deleted). Any failure — the state can't be determined, or a
- * confirmed image can't be removed — returns -errno and the caller must
- * refuse the read-write mount, exactly like upstream ntfs-3g does.
- */
-static int drop_hibernation_image(ntfs_volume *vol)
-{
-    if (!ntfs_volume_check_hiberfile(vol, 0))
-        return 0;               /* absent, or no valid image */
-    if (errno != EPERM)
-        return -(errno ? errno : EIO);   /* unreadable: state unknown */
-
-    /* A valid hibernation image is confirmed on disk. */
-    int err;
-    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, "hiberfil.sys");
-    if (!ni)
-        return -(errno ? errno : EIO);
-    ntfschar *uname = NULL;
-    int ulen = ntfs_mbstoucs("hiberfil.sys", &uname);
-    ntfs_inode *root = ntfs_inode_open(vol, FILE_root);
-    if (ulen > 0 && root) {
-        /* ntfs_delete closes both inodes, success or failure. */
-        if (!ntfs_delete(vol, NULL, ni, root, uname, (u8)ulen)) {
-            ntfs_log_info("MNtfs: removed hibernation image hiberfil.sys\n");
-            err = 0;
-        } else {
-            err = -(errno ? errno : EIO);
-            ntfs_log_error("MNtfs: cannot remove hiberfil.sys (%d); "
-                           "refusing read-write mount\n", -err);
-        }
-    } else {
-        err = -(errno ? errno : EIO);
-        ntfs_inode_close(ni);
-        if (root)
-            ntfs_inode_close(root);
-    }
-    free(uname);
-    return err;
 }
 
 /* Collect leftover ghost entries in the root directory. */
@@ -745,10 +754,20 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
     *err_out = 0;
     if (!sector_size) sector_size = 512;
     if (!valid_geometry(dev_size, sector_size)) { *err_out = EINVAL; return NULL; }
-    if (!readonly && !pwrite_cb) { *err_out = EINVAL; return NULL; }
+    if (!readonly && (!pwrite_cb || !flush_cb)) { *err_out = EINVAL; return NULL; }
+
+    /* Inspect through a read-only device before ANY writable mount. Unknown
+       state is not permission to discard Windows recovery data. */
+    uint32_t state = FNTFS_VSTATE_UNKNOWN;
+    if (!readonly) {
+        int rc = fntfs_check_state(ctx, pread_cb, dev_size, sector_size, &state);
+        if (rc) { *err_out = -rc; return NULL; }
+        if (state) readonly = true;
+    }
 
     fntfs_vol *v = calloc(1, sizeof(*v));
     if (!v) { *err_out = ENOMEM; return NULL; }
+    v->mount_state = state;
     /* Recursive: FSKit's directory enumeration calls back into fntfs_getattr
        from inside the fntfs_readdir packer callback, on the same thread. */
     pthread_mutexattr_t mattr;
@@ -759,8 +778,8 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
     v->devctx = (fntfs_dev_ctx){
         .swift_ctx = ctx,
         .pread_cb = pread_cb,
-        .pwrite_cb = pwrite_cb,
-        .flush_cb = flush_cb,
+        .pwrite_cb = readonly ? NULL : pwrite_cb,
+        .flush_cb = readonly ? NULL : flush_cb,
         .size = (int64_t)dev_size,
         .sector = sector_size ? sector_size : 512,
         .readonly = readonly,
@@ -773,15 +792,8 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
         return NULL;
     }
 
-    ntfs_mount_flags flags = 0;
-    if (readonly)
-        flags |= NTFS_MNT_RDONLY;
-    else
-        /* RECOVER replays a dirty $LogFile. IGNORE_HIBERFILE mounts read-write
-           even when Windows left a hiberfil.sys behind — which is the norm with
-           Fast Startup / hybrid shutdown (Windows 10/11 default) and otherwise
-           makes ntfs-3g refuse the mount entirely ("failed to mount"). */
-        flags |= NTFS_MNT_RECOVER | NTFS_MNT_IGNORE_HIBERFILE;
+    /* No RECOVER or IGNORE_HIBERFILE: journal reset is not journal replay. */
+    ntfs_mount_flags flags = readonly ? NTFS_MNT_RDONLY : 0;
 
     v->vol = ntfs_device_mount(v->dev, flags);
     if (!v->vol) {
@@ -796,6 +808,10 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
        Each mount owns its cache, so remounts never reuse stale device data. */
     v->devctx.read_cache = calloc(1, sizeof(small_io_cache));
 
+    v->vol->special_files = NTFS_FILES_WSL;
+    /* Reparse conversion uses a sentinel rather than a guessed host path.
+       symlink_target turns same-volume absolute results into relative links. */
+    v->vol->abs_mnt_point = "/.mntfs-volume-root";
     NVolSetShowHidFiles(v->vol);            /* surface hidden files      */
     NVolClearShowSysFiles(v->vol);          /* hide $MFT & co. (default on!) */
 
@@ -804,22 +820,7 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
        (allocation only) degrades to case-sensitive lookups; not fatal. */
     ntfs_set_ignore_case(v->vol);
 
-    if (!readonly) {
-        /* If a hibernation image is confirmed but can't be removed (or its
-           state can't even be determined), writing is unsafe: refuse the
-           read-write mount — upstream ntfs-3g fails the mount the same way.
-           The system then falls back to a read-only mount. */
-        int herr = drop_hibernation_image(v->vol);
-        if (herr) {
-            *err_out = -herr;
-            ntfs_umount(v->vol, FALSE);     /* also frees the device */
-            free(v->devctx.read_cache);
-            pthread_mutex_destroy(&v->lock);
-            free(v);
-            return NULL;
-        }
-        sweep_ghosts(v);
-    }
+    if (!readonly) sweep_ghosts(v);
     ntfs_volume_get_free_space(v->vol);     /* prime free-cluster count  */
 
     if (name_out) {
@@ -838,10 +839,12 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
 
 static int sync_all_locked(fntfs_vol *v)
 {
+    if (v->devctx.terminal_error) return -v->devctx.terminal_error;
+    if (v->devctx.readonly) return 0;
     int err = 0;
     for (int i = 0; i < FCACHE_SIZE; i++)
         if (v->cache[i].inum && ntfs_inode_sync(v->cache[i].ni) && !err)
-            err = -errno;
+            err = -(errno ? errno : EIO);
     /* libntfs-3g keeps these metadata inodes open outside our file cache.
        In particular, allocation can dirty $MFT/$Bitmap without dirtying a
        cached regular file. Flush them before the device's sync callback. */
@@ -851,8 +854,9 @@ static int sync_all_locked(fntfs_vol *v)
         if (metadata[i] && ntfs_inode_sync(metadata[i]) && !err)
             err = -(errno ? errno : EIO);
     if (v->dev->d_ops->sync(v->dev) && !err)
-        err = -errno;
-    return err;
+        err = -(errno ? errno : EIO);
+    if (err) device_fail(&v->devctx, -err);
+    return v->devctx.terminal_error ? -v->devctx.terminal_error : err;
 }
 
 int fntfs_sync(fntfs_vol *v)
@@ -866,9 +870,11 @@ int fntfs_sync(fntfs_vol *v)
 int fntfs_unmount(fntfs_vol *v)
 {
     LOCK(v);
-    int err = fcache_drop_all(v);
+    int err = sync_all_locked(v);
+    int drop_err = fcache_drop_all(v);
+    if (!err) err = drop_err;
     if (ntfs_umount(v->vol, FALSE) && !err)   /* also frees the device */
-        err = -errno;
+        err = -(errno ? errno : EIO);
     v->vol = NULL;
     UNLOCK(v);
     pthread_mutex_destroy(&v->lock);
@@ -1022,7 +1028,9 @@ static int bridge_filldir(void *dirent, const ntfschar *name,
         return 0;
     }
 
-    int32_t type = (dt_type == NTFS_DT_DIR) ? FNTFS_TYPE_DIR : FNTFS_TYPE_FILE;
+    int32_t type = dt_type == NTFS_DT_DIR ? FNTFS_TYPE_DIR :
+                   dt_type == NTFS_DT_LNK ? FNTFS_TYPE_SYMLINK :
+                   dt_type == NTFS_DT_REPARSE ? FNTFS_TYPE_REPARSE : FNTFS_TYPE_FILE;
     bool keep_going = rc->cb(rc->cbctx, utf8, type, MREF(mref), pos + 1);
     free(utf8);
     if (!keep_going) {
@@ -1076,6 +1084,7 @@ int64_t fntfs_write(fntfs_vol *v, uint64_t inum, const void *buf, int64_t len,
                     int64_t off)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     ntfs_inode *ni; ntfs_attr *na;
     int err = fcache_get(v, inum, &ni, &na);
     if (err) { UNLOCK(v); return err; }
@@ -1096,6 +1105,7 @@ int64_t fntfs_write(fntfs_vol *v, uint64_t inum, const void *buf, int64_t len,
 int fntfs_truncate(fntfs_vol *v, uint64_t inum, uint64_t size)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     ntfs_inode *ni; ntfs_attr *na;
     int err = fcache_get(v, inum, &ni, &na);
     if (err) { UNLOCK(v); return err; }
@@ -1111,6 +1121,8 @@ int fntfs_truncate(fntfs_vol *v, uint64_t inum, uint64_t size)
 
 static int name_to_ucs(const char *name, ntfschar **uname)
 {
+    if (!*name || !strcmp(name, ".") || !strcmp(name, "..") || strchr(name, '/'))
+        return -EINVAL;
     int len = ntfs_mbstoucs(name, uname);
     if (len < 0) return -errno;
     if (len > NTFS_MAX_NAME_LEN) { free(*uname); return -ENAMETOOLONG; }
@@ -1123,6 +1135,7 @@ int fntfs_create(fntfs_vol *v, uint64_t dir, const char *name, bool is_dir,
     if (is_reserved_name(name))
         return -EINVAL;
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     int err = 0;
     ntfschar *uname = NULL;
     int ulen = name_to_ucs(name, &uname);
@@ -1163,6 +1176,7 @@ int fntfs_create(fntfs_vol *v, uint64_t dir, const char *name, bool is_dir,
 int fntfs_remove(fntfs_vol *v, uint64_t dir, const char *name, uint64_t inum)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     int err = fcache_drop(v, inum);
     if (!err) err = fcache_drop(v, dir);
     if (err) { UNLOCK(v); return err; }   /* dirty data would be lost */
@@ -1194,6 +1208,7 @@ int fntfs_remove(fntfs_vol *v, uint64_t dir, const char *name, uint64_t inum)
 static int do_link(fntfs_vol *v, uint64_t inum, uint64_t dir, const char *name)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     int err = fcache_drop(v, inum);
     if (err) { UNLOCK(v); return err; }
 
@@ -1362,6 +1377,7 @@ int fntfs_rename2(fntfs_vol *v, uint64_t inum, uint64_t src_dir,
     if (is_reserved_name(dst_name))
         return -EINVAL;
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     int err;
     if (over_ghost_out)
         over_ghost_out[0] = '\0';
@@ -1522,6 +1538,7 @@ int fntfs_unlink_keep(fntfs_vol *v, uint64_t dir, const char *name,
                       uint64_t inum, char *ghost_out)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     ghost_out[0] = '\0';
 
     /* Decide *inside* the lock (a caller-side link-count check would race
@@ -1563,6 +1580,7 @@ int fntfs_settimes(fntfs_vol *v, uint64_t inum, const fntfs_attrs *times,
                    uint32_t mask)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     bool cached;
     ntfs_inode *ni = inode_get(v, inum, &cached);
     if (!ni) { int e = -errno; UNLOCK(v); return e; }
@@ -1600,6 +1618,7 @@ int fntfs_settimes(fntfs_vol *v, uint64_t inum, const fntfs_attrs *times,
 int fntfs_setwinattrs(fntfs_vol *v, uint64_t inum, uint32_t win_attrs)
 {
     LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
     bool cached;
     ntfs_inode *ni = inode_get(v, inum, &cached);
     if (!ni) { int e = -errno; UNLOCK(v); return e; }
@@ -1629,42 +1648,389 @@ int fntfs_forget(fntfs_vol *v, uint64_t inum)
     return err;
 }
 
+/* --- links and named streams -------------------------------------------- */
+
+static char *literal_utf8(const void *utf16, size_t length)
+{
+    if (!length || length % 2 || length > 16384) { errno = EILSEQ; return NULL; }
+    const unsigned char *bytes = utf16;
+    for (size_t i = 0; i < length; i += 2)
+        if (!bytes[i] && !bytes[i + 1]) { errno = EILSEQ; return NULL; }
+    CFStringRef text = CFStringCreateWithBytes(NULL, bytes, length, kCFStringEncodingUTF16LE, false);
+    if (!text) { errno = EILSEQ; return NULL; }
+    CFIndex capacity = CFStringGetMaximumSizeForEncoding(CFStringGetLength(text), kCFStringEncodingUTF8) + 1;
+    char *result = malloc((size_t)capacity);
+    if (result && !CFStringGetCString(text, result, capacity, kCFStringEncodingUTF8)) {
+        free(result); result = NULL; errno = EILSEQ;
+    }
+    CFRelease(text);
+    return result;
+}
+
+/* Turn an upstream same-volume absolute result into a relative path from
+   the link's parent. No guessed /Volumes path or Windows drive-letter mapping
+   may accidentally point into the macOS root. Cross-volume links stay opaque. */
+static char *symlink_target(ntfs_inode *ni)
+{
+    char *target = NULL;
+    if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+        ntfs_attr *na = ntfs_attr_open(ni, AT_REPARSE_POINT, AT_UNNAMED, 0);
+        REPARSE_POINT header;
+        if (!na) return NULL;
+        bool valid = na->data_size >= (s64)sizeof(header) && na->data_size <= 16384 &&
+            ntfs_attr_pread(na, 0, sizeof(header), &header) == sizeof(header);
+        if (valid && header.reparse_tag == IO_REPARSE_TAG_SYMLINK && na->data_size >= 20) {
+            size_t bytes = (size_t)na->data_size;
+            char *raw = malloc(bytes);
+            if (raw && ntfs_attr_pread(na, 0, bytes, raw) == (s64)bytes) {
+                le16 offset, length; le32 flags;
+                memcpy(&offset, raw + 8, 2); memcpy(&length, raw + 10, 2); memcpy(&flags, raw + 16, 4);
+                size_t start = 20 + le16_to_cpu(offset), count = le16_to_cpu(length);
+                if (le32_to_cpu(flags) == 1 && start <= bytes && count <= bytes - start) {
+                    char *relative = literal_utf8(raw + start, count);
+                    if (relative && *relative != '\\' && *relative != '/' &&
+                        !(strlen(relative) > 1 && relative[1] == ':')) {
+                        for (char *p = relative; *p; ++p) if (*p == '\\') *p = '/';
+                        target = relative;
+                    } else free(relative);
+                }
+            }
+            free(raw);
+        }
+        ntfs_attr_close(na);
+        if (!valid) { errno = EIO; return NULL; }
+        if (!target) target = ntfs_make_symlink(ni, "/.mntfs-volume-root");
+        if (!target) return NULL;
+        const char prefix[] = "/.mntfs-volume-root/";
+        if (header.reparse_tag != IO_REPARSE_TAG_LX_SYMLINK &&
+            !strncmp(target, prefix, sizeof(prefix) - 1)) {
+            const char *tail = target + sizeof(prefix) - 1;
+            if (!strncmp(tail, ".NTFS-3G/", 9)) {
+                free(target); errno = ENOTSUP; return NULL;
+            }
+            unsigned depth = 0;
+            ntfs_inode *parent = ntfs_dir_parent_inode(ni);
+            while (parent && parent->mft_no != FILE_root && depth < 256) {
+                ntfs_inode *next = ntfs_dir_parent_inode(parent);
+                ntfs_inode_close(parent);
+                parent = next;
+                ++depth;
+            }
+            bool valid = parent && parent->mft_no == FILE_root;
+            if (parent) ntfs_inode_close(parent);
+            if (!valid) { free(target); errno = ELOOP; return NULL; }
+            size_t len = depth * 3 + (*tail ? strlen(tail) : 1);
+            char *relative = malloc(len + 1);
+            if (!relative) { free(target); return NULL; }
+            for (unsigned i = 0; i < depth; ++i) memcpy(relative + i * 3, "../", 3);
+            strcpy(relative + depth * 3, *tail ? tail : ".");
+            free(target);
+            target = relative;
+        }
+    } else if ((ni->flags & FILE_ATTR_SYSTEM) && ntfs_interix_types(ni) == NTFS_DT_LNK) {
+        ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+        if (na) {
+            s64 len = na->data_size;
+            if (len > 8 && len <= 8192 && (len - 8) % 2 == 0) {
+                INTX_FILE *data = malloc((size_t)len);
+                if (data && ntfs_attr_pread(na, 0, len, data) == len)
+                    ntfs_ucstombs(data->target, (int)((len - 8) / 2), &target, 0);
+                free(data);
+            }
+            ntfs_attr_close(na);
+        }
+    }
+    if (!target) errno = ENOTSUP;
+    if (target && (!*target || strlen(target) >= 4096)) {
+        free(target); target = NULL; errno = ENAMETOOLONG;
+    }
+    return target;
+}
+
+int fntfs_symlink(fntfs_vol *v, uint64_t dir, const char *name,
+                  const char *target, fntfs_attrs *out)
+{
+    if (is_reserved_name(name) || !*target) return -EINVAL;
+    if (strlen(target) >= 4096) return -ENAMETOOLONG;
+    LOCK(v);
+    if (device_readonly(&v->devctx)) { UNLOCK(v); return -EROFS; }
+    ntfschar *uname = NULL, *utarget = NULL;
+    int len = name_to_ucs(name, &uname), err = 0;
+    if (len < 0) { UNLOCK(v); return len; }
+    int tlen = ntfs_mbstoucs(target, &utarget);
+    ntfs_inode *parent = tlen > 0 ? ntfs_inode_open(v->vol, dir) : NULL;
+    if (!parent) { err = -(errno ? errno : EINVAL); goto out; }
+    ntfs_inode *existing = ntfs_pathname_to_inode(v->vol, parent, name);
+    if (existing) {
+        ntfs_inode_close(existing); err = -EEXIST;
+    } else if (errno != ENOENT) {
+        err = -(errno ? errno : EIO);
+    } else {
+        ntfs_inode *ni = ntfs_create_symlink(parent, 0, uname, (u8)len, utarget, tlen);
+        if (!ni) err = -(errno ? errno : EIO);
+        else {
+            /* ntfs-3g's macOS pathname converter normalizes Unicode. A POSIX
+               link target is byte data: preserve its original UTF-8 spelling
+               in the WSL reparse payload after creating the inode/WSL EAs. */
+            size_t bytes = 12 + strlen(target);
+            char *raw = calloc(1, bytes);
+            if (!raw) err = -ENOMEM;
+            else {
+                le32 tag = IO_REPARSE_TAG_LX_SYMLINK, type = cpu_to_le32(2);
+                le16 data_len = cpu_to_le16(bytes - 8);
+                memcpy(raw, &tag, 4); memcpy(raw + 4, &data_len, 2);
+                memcpy(raw + 8, &type, 4); memcpy(raw + 12, target, strlen(target));
+                if (ntfs_set_ntfs_reparse_data(ni, raw, bytes, 0)) err = -(errno ? errno : EIO);
+                free(raw);
+            }
+            if (err) {
+                /* ntfs_delete consumes both handles. */
+                ntfs_delete(v->vol, NULL, ni, parent, uname, (u8)len);
+                parent = NULL;
+            } else {
+            fill_attrs(ni, out);
+            if (ntfs_inode_close_in_dir(ni, parent)) err = -(errno ? errno : EIO);
+            }
+        }
+    }
+    if (parent && ntfs_inode_close(parent) && !err) err = -(errno ? errno : EIO);
+out:
+    free(uname); free(utarget); UNLOCK(v); return err;
+}
+
+int64_t fntfs_readlink(fntfs_vol *v, uint64_t inum, void *buffer, size_t size)
+{
+    LOCK(v);
+    bool cached;
+    ntfs_inode *ni = inode_get(v, inum, &cached);
+    if (!ni) { int e = -(errno ? errno : EIO); UNLOCK(v); return e; }
+    char *target = symlink_target(ni);
+    int64_t result = target ? (int64_t)strlen(target) : -(errno ? errno : EINVAL);
+    if (target && buffer) {
+        if (size < (size_t)result) result = -ERANGE;
+        else memcpy(buffer, target, (size_t)result);
+    }
+    free(target);
+    int err = inode_put(ni, cached);
+    UNLOCK(v); return err ? err : result;
+}
+
+int64_t fntfs_get_reparse(fntfs_vol *v, uint64_t inum, void *buffer, size_t size)
+{
+    LOCK(v);
+    bool cached;
+    ntfs_inode *ni = inode_get(v, inum, &cached);
+    if (!ni) { int e = -(errno ? errno : EIO); UNLOCK(v); return e; }
+    ntfs_attr *na = ntfs_attr_open(ni, AT_REPARSE_POINT, AT_UNNAMED, 0);
+    int64_t result = na ? na->data_size : -(errno == ENOENT ? ENOATTR : (errno ? errno : EIO));
+    if (na && (result < 0 || result > 16384)) result = -EIO;
+    if (result >= 0 && buffer) {
+        if (size < (size_t)result) result = -ERANGE;
+        else if (ntfs_attr_pread(na, 0, result, buffer) != result) result = -EIO;
+    }
+    if (na) ntfs_attr_close(na);
+    int err = inode_put(ni, cached);
+    UNLOCK(v); return err ? err : result;
+}
+
+static int xattr_name(const char *name, ntfschar **unicode)
+{
+    size_t len = strlen(name);
+    if (!len || len > 127 || strchr(name, '/')) return -EINVAL;
+    /* Extended-attribute names are byte-sensitive. The filename converter
+       normalizes Unicode on macOS and would alias distinct NTFS streams. */
+    CFStringRef text = CFStringCreateWithBytes(NULL, (const UInt8 *)name, len,
+                                               kCFStringEncodingUTF8, false);
+    if (!text) return -EILSEQ;
+    CFIndex n = CFStringGetLength(text);
+    *unicode = calloc((size_t)n + 1, sizeof(ntfschar));
+    if (*unicode) {
+        CFStringGetCharacters(text, CFRangeMake(0, n), (UniChar *)*unicode);
+        for (CFIndex i = 0; i < n; ++i) (*unicode)[i] = cpu_to_le16((*unicode)[i]);
+    }
+    CFRelease(text);
+    return *unicode ? (int)n : -ENOMEM;
+}
+
+int64_t fntfs_getxattr(fntfs_vol *v, uint64_t inum, const char *name,
+                       void *buffer, size_t size)
+{
+    ntfschar *unicode = NULL;
+    int n = xattr_name(name, &unicode);
+    if (n < 0) return n;
+    LOCK(v);
+    bool cached;
+    ntfs_inode *ni = inode_get(v, inum, &cached);
+    ntfs_attr *na = ni ? ntfs_attr_open(ni, AT_DATA, unicode, n) : NULL;
+    int64_t result = na ? na->data_size : -(errno == ENOENT ? ENOATTR : (errno ? errno : EIO));
+    if (na && result < 0) result = -EIO;
+    if (result > FNTFS_MAX_XATTR_SIZE) result = -E2BIG;
+    if (result >= 0 && buffer) {
+        if (size < (size_t)result) result = -ERANGE;
+        else if (ntfs_attr_pread(na, 0, result, buffer) != result) result = -EIO;
+    }
+    if (na) ntfs_attr_close(na);
+    int err = ni ? inode_put(ni, cached) : 0;
+    free(unicode); UNLOCK(v); return err ? err : result;
+}
+
+int64_t fntfs_listxattr(fntfs_vol *v, uint64_t inum, void *buffer, size_t size)
+{
+    LOCK(v);
+    bool cached;
+    ntfs_inode *ni = inode_get(v, inum, &cached);
+    if (!ni) { int e = -(errno ? errno : EIO); UNLOCK(v); return e; }
+    ntfs_attr_search_ctx *ctx = ntfs_attr_get_search_ctx(ni, NULL);
+    int64_t used = 0;
+    if (!ctx) used = -(errno ? errno : EIO);
+    while (ctx && !ntfs_attr_lookup(AT_DATA, NULL, 0, CASE_SENSITIVE, 0, NULL, 0, ctx)) {
+        if (!ctx->attr->name_length) continue;
+        char *name = NULL;
+        name = literal_utf8((UInt8 *)ctx->attr + le16_to_cpu(ctx->attr->name_offset),
+                            ctx->attr->name_length * 2);
+        if (!name) {
+            if (errno == ENOMEM) { used = -ENOMEM; break; }
+            continue; /* Preserve streams whose names macOS cannot represent. */
+        }
+        int len = (int)strlen(name);
+        if (len && len <= 127 && !strchr(name, '/')) {
+            if (used + len + 1 > FNTFS_MAX_XATTR_SIZE) { free(name); used = -E2BIG; break; }
+            if (buffer && (size_t)(used + len + 1) > size) { free(name); used = -ERANGE; break; }
+            if (buffer) memcpy((char *)buffer + used, name, len + 1);
+            used += len + 1;
+        }
+        free(name);
+    }
+    if (ctx && used >= 0 && errno != ENOENT) used = -(errno ? errno : EIO);
+    if (ctx) ntfs_attr_put_search_ctx(ctx);
+    int err = inode_put(ni, cached);
+    UNLOCK(v); return err ? err : used;
+}
+
+static int stream_write(ntfs_attr *na, const void *value, size_t size)
+{
+    size_t done = 0;
+    while (done < size) {
+        s64 n = ntfs_attr_pwrite(na, done, size - done, (const char *)value + done);
+        if (n <= 0) return -(errno ? errno : EIO);
+        done += (size_t)n;
+    }
+    if (ntfs_attr_truncate(na, (s64)size) || ntfs_attr_pclose(na)) return -(errno ? errno : EIO);
+    return 0;
+}
+
+int fntfs_setxattr(fntfs_vol *v, uint64_t inum, const char *name,
+                    const void *value, size_t size, int policy)
+{
+    if (size > FNTFS_MAX_XATTR_SIZE) return -E2BIG;
+    if (policy < FNTFS_XATTR_SET || policy > FNTFS_XATTR_DELETE || (size && !value)) return -EINVAL;
+    ntfschar *unicode = NULL;
+    int n = xattr_name(name, &unicode);
+    if (n < 0) return n;
+    LOCK(v);
+    int err = 0;
+    if (device_readonly(&v->devctx)) { err = -EROFS; goto unlock; }
+    bool cached;
+    ntfs_inode *ni = inode_get(v, inum, &cached);
+    if (!ni) { err = -(errno ? errno : EIO); goto unlock; }
+    ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, unicode, n);
+    bool existed = na != NULL;
+    if (!na && errno != ENOENT) { err = -(errno ? errno : EIO); goto close_inode; }
+    if (existed && policy == FNTFS_XATTR_CREATE) { err = -EEXIST; goto close_attr; }
+    if (!existed && (policy == FNTFS_XATTR_REPLACE || policy == FNTFS_XATTR_DELETE)) {
+        err = -ENOATTR; goto close_attr;
+    }
+    if (policy == FNTFS_XATTR_DELETE) {
+        if (ntfs_attr_rm(na)) err = -(errno ? errno : EIO);
+    } else {
+        size_t previous_size = existed ? (size_t)na->data_size : 0;
+        if (previous_size > FNTFS_MAX_XATTR_SIZE) { err = -E2BIG; goto close_attr; }
+        void *previous = previous_size ? malloc(previous_size) : NULL;
+        if (previous_size && !previous) { err = -ENOMEM; goto close_attr; }
+        if (previous_size && ntfs_attr_pread(na, 0, previous_size, previous) != (s64)previous_size) {
+            free(previous); err = -EIO; goto close_attr;
+        }
+        if (!existed) {
+            if (ntfs_attr_add(ni, AT_DATA, unicode, n, NULL, 0)) err = -(errno ? errno : EIO);
+            else na = ntfs_attr_open(ni, AT_DATA, unicode, n);
+            if (!na && !err) err = -(errno ? errno : EIO);
+        }
+        if (!err) err = stream_write(na, value, size);
+        /* A transient failure must not truncate the previous value. A failed
+           rollback is reported too; persistent device failure cannot be made
+           transactional by this non-journaling bridge. */
+        if (err && na) {
+            if (existed) { if (stream_write(na, previous, previous_size)) err = -EIO; }
+            else if (ntfs_attr_rm(na)) err = -EIO;
+        }
+        free(previous);
+    }
+    if (!err) {
+        ni->flags |= FILE_ATTR_ARCHIVE;
+        ntfs_inode_update_times(ni, NTFS_UPDATE_CTIME);
+    }
+close_attr:
+    if (na) ntfs_attr_close(na);
+close_inode: {
+    int close_err = inode_put(ni, cached);
+    if (!err) err = close_err;
+}
+unlock:
+    free(unicode); UNLOCK(v); return err;
+}
+
 /* --- consistency check ---------------------------------------------------- */
+
+bool fntfs_is_readonly(fntfs_vol *v)
+{
+    LOCK(v);
+    bool result = device_readonly(&v->devctx);
+    UNLOCK(v);
+    return result;
+}
+
+int fntfs_io_error(fntfs_vol *v)
+{
+    LOCK(v);
+    int result = v->devctx.terminal_error;
+    UNLOCK(v);
+    return result;
+}
+uint32_t fntfs_mount_state(fntfs_vol *v) { return v->mount_state; }
 
 int fntfs_check_state(void *ctx, fntfs_pread_cb pread_cb, uint64_t dev_size,
                       uint32_t sector_size, uint32_t *state_out)
 {
-    *state_out = 0;
+    *state_out = FNTFS_VSTATE_UNKNOWN;
     int err = 0;
-    /* Read-only mount: never touches the device, and (unlike a read-write
-       mount) performs no log replay or hiberfile removal, so the dirty state
-       is observed as-is. */
     fntfs_vol *v = fntfs_mount(ctx, pread_cb, NULL, NULL, dev_size,
                                sector_size, true, NULL, NULL, &err);
-    if (!v)
-        return -(err ? err : EIO);
+    if (!v) return -(err ? err : EIO);
     ntfs_volume *vol = v->vol;
+    uint32_t state = (vol->flags & VOLUME_IS_DIRTY) ? FNTFS_VSTATE_DIRTY : 0;
 
-    if (vol->flags & VOLUME_IS_DIRTY)
-        *state_out |= FNTFS_VSTATE_DIRTY;
-
-    if (ntfs_volume_check_hiberfile(vol, 0) && errno == EPERM)
-        *state_out |= FNTFS_VSTATE_HIBERNATED;
-
-    ntfs_inode *ni = ntfs_inode_open(vol, FILE_LogFile);
-    if (ni) {
-        ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-        if (na) {
-            RESTART_PAGE_HEADER *rp = NULL;
-            if (!ntfs_check_logfile(na, &rp) ||
-                !ntfs_is_logfile_clean(na, rp))
-                *state_out |= FNTFS_VSTATE_LOG_DIRTY;
-            free(rp);
-            ntfs_attr_close(na);
-        }
-        ntfs_inode_close(ni);
+    errno = 0;
+    if (ntfs_volume_check_hiberfile(vol, 0)) {
+        state |= errno == EPERM ? FNTFS_VSTATE_HIBERNATED : FNTFS_VSTATE_UNKNOWN;
     }
 
-    fntfs_unmount(v);
-    return 0;
+    ntfs_inode *ni = ntfs_inode_open(vol, FILE_LogFile);
+    ntfs_attr *na = ni ? ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0) : NULL;
+    if (na) {
+        RESTART_PAGE_HEADER *rp = NULL;
+        if (!ntfs_check_logfile(na, &rp))
+            state |= FNTFS_VSTATE_UNKNOWN;
+        else if (!ntfs_is_logfile_clean(na, rp) ||
+                 (rp && rp->major_ver == const_cpu_to_le16(2) &&
+                        rp->minor_ver == const_cpu_to_le16(0)))
+            state |= FNTFS_VSTATE_LOG_DIRTY;
+        free(rp);
+        ntfs_attr_close(na);
+    } else {
+        state |= FNTFS_VSTATE_UNKNOWN;
+    }
+    if (ni) ntfs_inode_close(ni);
+    int rc = fntfs_unmount(v);
+    *state_out = state;
+    return rc;
 }

@@ -62,20 +62,6 @@ static void run_tests(uint32_t ss)
     assert(dev_pread_aligned(&c, result, 2 * ss, 0) == 2 * ss);
     assert(result[0] == 0x11 && result[ss] == 0x77);
 
-    /* Even failed writes invalidate stale entries. */
-    memset(data, 0x55, sizeof(data));
-    fail_write = true;
-    assert(dev_pwrite_aligned(&c, data, 2 * ss, 0) == -EIO);
-    assert(dev_pread_aligned(&c, result, 2 * ss, 0) == 2 * ss);
-    assert(result[0] == 0x55 && result[ss] == 0x77);
-
-    /* Failed/short reads must not become cache hits. */
-    short_read = true;
-    assert(dev_pread_aligned(&c, result, ss, 4 * ss) == 0);
-    int before = reads;
-    assert(dev_pread_aligned(&c, result, ss, 4 * ss) == ss);
-    assert(reads == before + 1);
-
     /* A large bypassing write also invalidates every overlapping entry. */
     unsigned char *big = malloc((2 << 20) + 5);
     assert(big);
@@ -101,9 +87,29 @@ static void run_tests(uint32_t ss)
     assert(!memcmp(disk + 1, big, (2 << 20) + 5));
 
     /* The two sectors of a straddling write preserve both outside bytes. */
+    memset(data, 0x55, sizeof(data));
     assert(dev_pwrite_aligned(&c, data, 2, 3 * ss - 1) == 2);
     assert(disk[3 * ss - 2] == 0x99 && disk[3 * ss + 1] == 0x99);
     assert(disk[3 * ss - 1] == 0x55 && disk[3 * ss] == 0x55);
+
+    /* Failed writes invalidate cached reads and permanently block writes. */
+    memset(data, 0x55, sizeof(data));
+    fail_write = true;
+    assert(dev_pwrite_aligned(&c, data, 2 * ss, 0) == -EIO);
+    assert(dev_pread_aligned(&c, result, 2 * ss, 0) == 2 * ss);
+    assert(result[0] == 0x55 && result[ss] == 0x99);
+
+    assert(c.terminal_error == EIO);
+    int calls_before = writes;
+    assert(dev_pwrite_aligned(&c, data, ss, 0) == -EROFS);
+    assert(writes == calls_before);  /* backend recovered, handle stays blocked */
+
+    /* Failed/short reads must not become cache hits. */
+    short_read = true;
+    assert(dev_pread_aligned(&c, result, ss, 4 * ss) == 0);
+    int before = reads;
+    assert(dev_pread_aligned(&c, result, ss, 4 * ss) == ss);
+    assert(reads == before + 1);
 
     free(big); free(cache);
     printf("device I/O tests passed (%u-byte sectors)\n", ss);

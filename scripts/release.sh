@@ -46,7 +46,7 @@ xcodebuild -project "$TASK_ROOT/FastNTFS.xcodeproj" -scheme FastNTFS -configurat
     -packageCachePath "$TASK_ROOT/build/PackageCache" \
     -derivedDataPath "$TASK_ROOT/build/DerivedData" \
     CONFIGURATION_BUILD_DIR="$TASK_ROOT/build/Release" \
-    CODE_SIGNING_ALLOWED=NO build >/tmp/mntfs-build.log 2>&1 \
+    CODE_SIGNING_ALLOWED=NO LSREGISTER_ENABLE=NO build >/tmp/mntfs-build.log 2>&1 \
     || { tail -20 /tmp/mntfs-build.log; exit 1; }
 
 BUILT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
