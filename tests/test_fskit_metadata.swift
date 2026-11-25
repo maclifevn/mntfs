@@ -38,8 +38,52 @@ struct FSKitMetadataRegression {
         let resource = ImageResource(CommandLine.arguments[1])
         let device = BlockDevice(resource: resource)
         var error: Int32 = 0
+
+        // A volume kept read-only only by a hibernation image reopens writable
+        // at mount (MNtfs 0.1.1 policy); a request not covering it changes nothing.
+        let prep = fntfs_mount(device.opaque, devPread, devPwrite, devFlush,
+            device.sizeBytes, 512, false, nil, nil, &error)!
+        var hib = fntfs_attrs()
+        var header = [UInt8](repeating: 0, count: 4096); header[0...3] = [0x68, 0x69, 0x62, 0x72] // "hibr"
+        precondition(fntfs_create(prep, fntfs_root_inum(), "hiberfil.sys", false, &hib) == 0)
+        precondition(fntfs_write(prep, hib.inum, header, 4096, 0) == 4096)
+        precondition(fntfs_unmount(prep) == 0)
+        // A requested read-only mount is never changed.
+        let requestedRO = fntfs_mount(device.opaque, devPread, nil, nil,
+            device.sizeBytes, 512, true, nil, nil, &error)!
+        let roVolume = NTFSVolume(device: device, readOnly: true, vol: requestedRO, name: "Test", serial: 1)
+        roVolume.enableWriting(discarding: UInt32(FNTFS_VSTATE_DISCARDABLE))
+        if #available(macOS 26.4, *) { precondition(roVolume.requestedMountOptions.contains(.readOnly)) }
+        precondition(roVolume.shutdownVolume() == 0)
+        precondition(NTFSVolume.requestsReadOnly(["-o", "nodev,noowners,rdonly,nofollow"]))
+        precondition(!NTFSVolume.requestsReadOnly(["-o", "nodev,noowners,nosuid,nofollow"]))
+        let held = fntfs_mount(device.opaque, devPread, devPwrite, devFlush,
+            device.sizeBytes, 512, false, nil, nil, &error)!
+        precondition(fntfs_is_readonly(held) && fntfs_mount_state(held) == UInt32(FNTFS_VSTATE_HIBERNATED))
+        let hibernatedVolume = NTFSVolume(device: device, readOnly: true, vol: held, name: "Test", serial: 1)
+        hibernatedVolume.enableWriting(discarding: UInt32(FNTFS_VSTATE_LOG_DIRTY)) // does not cover the state: no change
+        if #available(macOS 26.4, *) { precondition(hibernatedVolume.requestedMountOptions.contains(.readOnly)) }
+        // Check through a separate read-only handle: an FSKit lookup would add
+        // a live item, and the volume rightly refuses to swap handles then.
+        let peek = fntfs_mount(device.opaque, devPread, nil, nil, device.sizeBytes, 512, true, nil, nil, &error)!
+        var still = fntfs_attrs()
+        precondition(fntfs_lookup(peek, fntfs_root_inum(), "hiberfil.sys", &still) == 0,
+                     "image must survive a non-covering request")
+        precondition(fntfs_unmount(peek) == 0)
+        hibernatedVolume.enableWriting(discarding: UInt32(FNTFS_VSTATE_HIBERNATED))
+        if #available(macOS 26.4, *) { precondition(hibernatedVolume.requestedMountOptions.isEmpty) }
+        hibernatedVolume.getXattr(named: FSFileName(string: NTFSMountStatus.attributeName),
+                           of: NTFSItem(inum: fntfs_root_inum(), type: .directory)) { data, err in
+            let status = try! JSONDecoder().decode(NTFSMountStatus.self, from: data!)
+            precondition(err == nil && status.isConsistent && !status.readOnly && status.safetyFlags == 0)
+            precondition(status.discardedWindowState == UInt32(FNTFS_VSTATE_HIBERNATED))
+        }
+        precondition(hibernatedVolume.shutdownVolume() == 0)
+
         let handle = fntfs_mount(device.opaque, devPread, devPwrite, devFlush,
             device.sizeBytes, 512, false, nil, nil, &error)!
+        var gone = fntfs_attrs()
+        precondition(fntfs_lookup(handle, fntfs_root_inum(), "hiberfil.sys", &gone) == -ENOENT)
         let volume = NTFSVolume(device: device, readOnly: false, vol: handle, name: "Test", serial: 1)
         let root = NTFSItem(inum: fntfs_root_inum(), type: .directory)
         let attributes = FSItem.SetAttributesRequest()

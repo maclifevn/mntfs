@@ -1393,10 +1393,17 @@ private struct DetailPane: View {
 
             // hero: capacity ring + info
             if v.isNTFS && v.mounted && v.readOnly {
-                Label(v.driverStatus?.readOnlyExplanation ?? "This drive is read-only. The reason has not been verified. Check write protection and the requested mount mode. If Windows used hibernation or Fast Startup, resume Windows and shut down fully; use chkdsk /f on Windows if repair is needed.",
+                Label(v.driverStatus?.readOnlyExplanation ?? "This drive is read-only. The reason has not been verified. Check write protection, eject and reconnect the drive, and run chkdsk /f on Windows if repair is needed.",
                       systemImage: "lock.shield")
                     .font(.system(size: 12))
                     .foregroundStyle(UI.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 34).padding(.top, 16)
+            } else if v.isNTFS && v.mounted, let note = v.driverStatus?.discardedExplanation {
+                Label(note + " Connect it to Windows only after Windows has started. To avoid this, turn off Fast Startup and use Safely Remove in Windows.",
+                      systemImage: "info.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(UI.dim)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 34).padding(.top, 16)
             }

@@ -7,9 +7,37 @@ struct DiagnosticRegression {
         let hibernated = NTFSMountStatus(readOnly: true, safetyFlags: 2, io: NTFSIOStatistics())
         precondition(clean.isConsistent && hibernated.isConsistent)
         precondition(!NTFSMountStatus(readOnly: false, safetyFlags: 2, io: NTFSIOStatistics()).isConsistent)
-        precondition(!NTFSMountStatus(readOnly: true, safetyFlags: 16, io: NTFSIOStatistics()).isConsistent)
+        precondition(!NTFSMountStatus(readOnly: true, safetyFlags: 32, io: NTFSIOStatistics()).isConsistent)
+        // A read-only request (write-protected device, `diskutil mount
+        // readOnly`, or DA after a failed check) names that cause first, then
+        // what the read-only inspection found.
+        let forced = NTFSMountStatus(readOnly: true, safetyFlags: 16 | 4, io: NTFSIOStatistics())
+        precondition(forced.isConsistent && forced.readOnlyExplanation.hasPrefix("Read-only access was requested"))
+        precondition(forced.readOnlyExplanation.contains("Fast Startup"))
+        let requested = NTFSMountStatus(readOnly: true, safetyFlags: 16, io: NTFSIOStatistics())
+        precondition(requested.isConsistent && requested.readOnlyExplanation.contains("requested"))
+        precondition(!NTFSMountStatus(readOnly: false, safetyFlags: 16, io: NTFSIOStatistics()).isConsistent)
         precondition(hibernated.readOnlyExplanation.contains("hibernation"))
-        precondition(hibernated.readOnlyExplanation.contains("preserves"))
+        precondition(!hibernated.readOnlyExplanation.contains("preserves"))
+        let dirty = NTFSMountStatus(readOnly: true, safetyFlags: 1, io: NTFSIOStatistics())
+        precondition(dirty.readOnlyExplanation.contains("needing repair") && dirty.readOnlyExplanation.contains("chkdsk"))
+        // A failed automatic pass: what is already gone is reported too.
+        let partial = NTFSMountStatus(readOnly: true, safetyFlags: 2 | 8, io: NTFSIOStatistics(),
+                                      discardedWindowState: 4)
+        precondition(partial.isConsistent && partial.readOnlyExplanation.contains("reset the NTFS journal"))
+        let reset = NTFSMountStatus(readOnly: false, safetyFlags: 0, io: NTFSIOStatistics(),
+                                    discardedWindowState: 6)
+        precondition(reset.isConsistent && reset.discardedExplanation!.contains("hiberfil.sys"))
+        precondition(clean.discardedExplanation == nil)
+        precondition(!NTFSMountStatus(readOnly: false, safetyFlags: 0, io: NTFSIOStatistics(),
+                                      discardedWindowState: 1).isConsistent)
+        let encoded = try JSONEncoder().encode(reset)
+        let decodedStatus = try JSONDecoder().decode(NTFSMountStatus.self, from: encoded)
+        precondition(decodedStatus == reset)
+        // Older extensions omit the field.
+        let legacy = try JSONDecoder().decode(NTFSMountStatus.self,
+            from: JSONEncoder().encode(clean))
+        precondition(legacy.discardedWindowState == nil && legacy.isConsistent)
         let failed = NTFSMountStatus(readOnly: true, safetyFlags: 0, io: NTFSIOStatistics(), failureError: EIO)
         precondition(failed.isConsistent && failed.readOnlyExplanation.contains("Writing stopped"))
         precondition(!NTFSMountStatus(readOnly: false, safetyFlags: 0, io: NTFSIOStatistics(), failureError: EIO).isConsistent)

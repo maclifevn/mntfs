@@ -2,8 +2,17 @@
 
 MNtfs checks the dirty bit, hibernation image and NTFS journal through a
 read-only device before requesting write access. Unsafe or unknown state
-keeps the volume read-only. No journal reset or hibernation-image removal is
-performed. The check is a mount-state check, not a full consistency scan.
+keeps the volume read-only, except Windows Fast Startup / hibernation state:
+as in MNtfs 0.1.1, when an unclosed journal and/or a hibernation image are the
+only unsafe state, a read-write mount resets the journal (no replay), flushes,
+then deletes `hiberfil.sys` and flushes again, inspects the volume again and
+mounts it read-write. The journal goes first so no metadata changes while a
+live Windows journal could replay over it. A failed pass keeps the volume
+read-only even if it then reads clean. A requested read-only mount changes
+nothing, and a dirty or unverifiable volume is never made writable. On macOS
+before 26.4 FSKit cannot downgrade a mount to read-only, so if that pass fails
+there the mount looks writable but rejects writes. The check is a mount-state
+check, not a full consistency scan.
 
 `fntfs_sync` writes regular-file and system metadata, then calls the backend
 flush callback. Unmount also synchronizes, and preserves the first error.
@@ -34,9 +43,14 @@ Always eject before disconnecting a drive.
 
 `./scripts/test.sh` uses only temporary images and memory-backed resources:
 
-- Dirty, hibernated and damaged-journal fixtures fall back to read-only;
-  mutators return `EROFS`, no write callback occurs, and every image byte is
-  compared with its pre-mount snapshot.
+- With a plain `fntfs_mount`, dirty, hibernated, Fast Startup and
+  damaged-journal fixtures fall back to read-only; mutators return `EROFS`, no
+  write callback occurs, and every image byte is compared with its pre-mount
+  snapshot. The automatic discard never touches a dirty or damaged volume; a
+  hibernation image and/or Fast Startup journal is discarded and the volume
+  mounts read-write with file data intact. Injected flush and write failures
+  during the pass keep the volume read-only, and a failure after the journal
+  reset leaves `hiberfil.sys` in place.
 - After successful sync, a child exits without unmounting. A fresh mount
   verifies the complete payload and logical file size.
 - Injected flush failures and device disappearance reach sync/unmount callers.

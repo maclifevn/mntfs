@@ -724,6 +724,13 @@ static bool boot_sector_is_ntfs(void *ctx, fntfs_pread_cb pread_cb,
     return ok;
 }
 
+static fntfs_vol *mount_impl(void *ctx, fntfs_pread_cb pread_cb,
+                             fntfs_pwrite_cb pwrite_cb, fntfs_flush_cb flush_cb,
+                             uint64_t dev_size, uint32_t sector_size,
+                             bool readonly, bool inspect_ro, uint32_t discard,
+                             uint32_t *discarded_out, char *name_out,
+                             uint64_t *serial_out, int *err_out);
+
 int fntfs_probe(void *ctx, fntfs_pread_cb pread_cb, uint64_t dev_size,
                 uint32_t sector_size, char *name_out, uint64_t *serial_out)
 {
@@ -738,12 +745,130 @@ int fntfs_probe(void *ctx, fntfs_pread_cb pread_cb, uint64_t dev_size,
 
     /* Try a real read-only mount to fetch the label and validate state. */
     int err = 0;
-    fntfs_vol *v = fntfs_mount(ctx, pread_cb, NULL, NULL, dev_size,
-                               sector_size, true, name_out, serial_out, &err);
+    fntfs_vol *v = mount_impl(ctx, pread_cb, NULL, NULL, dev_size, sector_size,
+                              true, false, 0, NULL, name_out, serial_out, &err);
     if (!v)
         return FNTFS_PROBE_RECOGNIZED;
     fntfs_unmount(v);
     return FNTFS_PROBE_USABLE;
+}
+
+/* Read-only inspection of a mounted volume's Windows safety state. */
+static uint32_t inspect_state(ntfs_volume *vol)
+{
+    uint32_t state = (vol->flags & VOLUME_IS_DIRTY) ? FNTFS_VSTATE_DIRTY : 0;
+
+    errno = 0;
+    if (ntfs_volume_check_hiberfile(vol, 0)) {
+        state |= errno == EPERM ? FNTFS_VSTATE_HIBERNATED : FNTFS_VSTATE_UNKNOWN;
+    }
+
+    ntfs_inode *ni = ntfs_inode_open(vol, FILE_LogFile);
+    ntfs_attr *na = ni ? ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0) : NULL;
+    if (na) {
+        RESTART_PAGE_HEADER *rp = NULL;
+        if (!ntfs_check_logfile(na, &rp))
+            state |= FNTFS_VSTATE_UNKNOWN;
+        else if (!ntfs_is_logfile_clean(na, rp) ||
+                 (rp && rp->major_ver == const_cpu_to_le16(2) &&
+                        rp->minor_ver == const_cpu_to_le16(0)))
+            state |= FNTFS_VSTATE_LOG_DIRTY;
+        free(rp);
+        ntfs_attr_close(na);
+    } else {
+        state |= FNTFS_VSTATE_UNKNOWN;
+    }
+    if (ni) ntfs_inode_close(ni);
+    return state;
+}
+
+/* Delete a confirmed hibernation image (ntfs-3g's remove_hiberfile policy).
+   Only reached when the mount discards Windows hibernation state. */
+static int drop_hibernation_image(ntfs_volume *vol)
+{
+    errno = 0;
+    if (!ntfs_volume_check_hiberfile(vol, 0))
+        return 0;                               /* absent, or no valid image */
+    if (errno != EPERM)
+        return -(errno ? errno : EIO);          /* unreadable: state unknown */
+
+    int err;
+    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, "hiberfil.sys");
+    if (!ni)
+        return -(errno ? errno : EIO);
+    ntfschar *uname = NULL;
+    int ulen = ntfs_mbstoucs("hiberfil.sys", &uname);
+    ntfs_inode *root = ntfs_inode_open(vol, FILE_root);
+    if (ulen > 0 && root) {
+        /* ntfs_delete closes both inodes, success or failure. */
+        err = ntfs_delete(vol, NULL, ni, root, uname, (u8)ulen)
+            ? -(errno ? errno : EIO) : 0;
+    } else {
+        err = -(errno ? errno : EIO);
+        ntfs_inode_close(ni);
+        if (root) ntfs_inode_close(root);
+    }
+    free(uname);
+    return err;
+}
+
+/* Flush everything a pass changed: metadata inodes, then the device. */
+static int sync_forensic_pass(ntfs_volume *vol, struct ntfs_device *dev)
+{
+    int err = 0;
+    ntfs_inode *metadata[] = { vol->vol_ni, vol->lcnbmp_ni, vol->mft_ni,
+                               vol->mftmirr_ni, vol->secure_ni };
+    for (size_t i = 0; i < sizeof(metadata) / sizeof(metadata[0]); i++)
+        if (metadata[i] && ntfs_inode_sync(metadata[i]) && !err)
+            err = -(errno ? errno : EIO);
+    if (dev->d_ops->sync(dev) && !err)
+        err = -(errno ? errno : EIO);
+    return err;
+}
+
+/* A volume Windows left in Fast Startup / hibernation state is made writable
+   (MNtfs 0.1.1 policy). Change exactly the requested items, durably, before
+   the normal writable mount re-inspects the volume from scratch:
+     FNTFS_VSTATE_LOG_DIRTY  -> reset (not replay) $LogFile, then flush
+     FNTFS_VSTATE_HIBERNATED -> delete hiberfil.sys (the saved session is lost)
+   The journal goes first, as upstream does: no metadata may change on disk
+   while a live Windows journal could still replay over it. If deleting the
+   image fails after that, only $LogFile changed and the image survives.
+   FORENSIC only skips upstream's refusal for this one pass; it performs no
+   ghost sweep or $TXF_DATA fix of its own. */
+static int discard_windows_state(void *ctx, fntfs_pread_cb pread_cb,
+                                 fntfs_pwrite_cb pwrite_cb,
+                                 fntfs_flush_cb flush_cb, uint64_t dev_size,
+                                 uint32_t sector_size, uint32_t state)
+{
+    fntfs_dev_ctx dc = {
+        .swift_ctx = ctx, .pread_cb = pread_cb, .pwrite_cb = pwrite_cb,
+        .flush_cb = flush_cb, .size = (int64_t)dev_size, .sector = sector_size,
+    };
+    struct ntfs_device *dev = ntfs_device_alloc("fastntfs", 0, &fntfs_dops, &dc);
+    if (!dev) return -ENOMEM;
+    ntfs_volume *vol = ntfs_device_mount(dev, NTFS_MNT_FORENSIC);
+    if (!vol) {
+        int e = errno ? errno : EIO;
+        ntfs_device_free(dev);
+        return -e;
+    }
+    ntfs_set_ignore_case(vol);
+    int err = 0;
+    if ((state & FNTFS_VSTATE_LOG_DIRTY) && ntfs_logfile_reset(vol))
+        err = -(errno ? errno : EIO);
+    if (!err && (state & FNTFS_VSTATE_LOG_DIRTY))
+        err = sync_forensic_pass(vol, dev);       /* barrier before metadata */
+    if (!err && (state & FNTFS_VSTATE_HIBERNATED)) {
+        err = drop_hibernation_image(vol);
+        int serr = sync_forensic_pass(vol, dev);
+        if (!err) err = serr;
+    }
+    if (ntfs_umount(vol, FALSE) && !err)        /* also frees the device */
+        err = -(errno ? errno : EIO);
+    if (dc.terminal_error && !err)
+        err = -dc.terminal_error;
+    return err;
 }
 
 fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
@@ -751,17 +876,64 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
                        uint64_t dev_size, uint32_t sector_size, bool readonly,
                        char *name_out, uint64_t *serial_out, int *err_out)
 {
+    return mount_impl(ctx, pread_cb, pwrite_cb, flush_cb, dev_size,
+                      sector_size, readonly, true, 0, NULL, name_out,
+                      serial_out, err_out);
+}
+
+fntfs_vol *fntfs_mount_discarding(void *ctx, fntfs_pread_cb pread_cb,
+                                  fntfs_pwrite_cb pwrite_cb,
+                                  fntfs_flush_cb flush_cb, uint64_t dev_size,
+                                  uint32_t sector_size, uint32_t discard,
+                                  uint32_t *discarded_out, char *name_out,
+                                  uint64_t *serial_out, int *err_out)
+{
+    return mount_impl(ctx, pread_cb, pwrite_cb, flush_cb, dev_size,
+                      sector_size, false, true, discard, discarded_out,
+                      name_out, serial_out, err_out);
+}
+
+/* inspect_ro: a mount the caller will use as a volume. On a requested
+   read-only mount it still inspects (read-only) why the volume is unsafe so
+   the live status names the real reason. Internal probe/check mounts skip
+   that and the free-space scan of the whole $Bitmap. */
+static fntfs_vol *mount_impl(void *ctx, fntfs_pread_cb pread_cb,
+                             fntfs_pwrite_cb pwrite_cb, fntfs_flush_cb flush_cb,
+                             uint64_t dev_size, uint32_t sector_size,
+                             bool readonly, bool inspect_ro, uint32_t discard,
+                             uint32_t *discarded_out, char *name_out,
+                             uint64_t *serial_out, int *err_out)
+{
     *err_out = 0;
+    if (discarded_out) *discarded_out = 0;
     if (!sector_size) sector_size = 512;
     if (!valid_geometry(dev_size, sector_size)) { *err_out = EINVAL; return NULL; }
     if (!readonly && (!pwrite_cb || !flush_cb)) { *err_out = EINVAL; return NULL; }
 
     /* Inspect through a read-only device before ANY writable mount. Unknown
        state is not permission to discard Windows recovery data. */
-    uint32_t state = FNTFS_VSTATE_UNKNOWN;
+    const bool requested_ro = readonly;
+    uint32_t state = FNTFS_VSTATE_RO_REQUESTED | FNTFS_VSTATE_UNKNOWN;
     if (!readonly) {
         int rc = fntfs_check_state(ctx, pread_cb, dev_size, sector_size, &state);
         if (rc) { *err_out = -rc; return NULL; }
+        /* Discard only when the request covers EVERY unsafe bit, and only the
+           discardable kinds: a dirty or unverifiable volume stays untouched. */
+        discard &= FNTFS_VSTATE_DISCARDABLE;
+        if (state && !(state & ~discard)) {
+            const uint32_t before = state;
+            int derr = discard_windows_state(ctx, pread_cb, pwrite_cb, flush_cb,
+                                             dev_size, sector_size, before);
+            /* Re-inspect from scratch whatever happened. Report what is gone
+               even on failure: the journal may be reset with the image kept. */
+            rc = fntfs_check_state(ctx, pread_cb, dev_size, sector_size, &state);
+            if (discarded_out && !rc)
+                *discarded_out = before & ~state & FNTFS_VSTATE_DISCARDABLE;
+            if (rc) { *err_out = -rc; return NULL; }
+            /* A failed pass is never trusted, even if the volume now reads
+               clean: its writes may not be durable or complete. */
+            if (derr) state |= FNTFS_VSTATE_UNKNOWN;
+        }
         if (state) readonly = true;
     }
 
@@ -820,8 +992,14 @@ fntfs_vol *fntfs_mount(void *ctx, fntfs_pread_cb pread_cb,
        (allocation only) degrades to case-sensitive lookups; not fatal. */
     ntfs_set_ignore_case(v->vol);
 
+    if (requested_ro && inspect_ro)
+        v->mount_state = FNTFS_VSTATE_RO_REQUESTED | inspect_state(v->vol);
+
     if (!readonly) sweep_ghosts(v);
-    ntfs_volume_get_free_space(v->vol);     /* prime free-cluster count  */
+    /* Prime the free-cluster count; this reads all of $Bitmap, so internal
+       probe/check mounts (several per Disk Arbitration mount) skip it. */
+    if (inspect_ro)
+        ntfs_volume_get_free_space(v->vol);
 
     if (name_out) {
         name_out[0] = '\0';
@@ -2003,33 +2181,10 @@ int fntfs_check_state(void *ctx, fntfs_pread_cb pread_cb, uint64_t dev_size,
 {
     *state_out = FNTFS_VSTATE_UNKNOWN;
     int err = 0;
-    fntfs_vol *v = fntfs_mount(ctx, pread_cb, NULL, NULL, dev_size,
-                               sector_size, true, NULL, NULL, &err);
+    fntfs_vol *v = mount_impl(ctx, pread_cb, NULL, NULL, dev_size, sector_size,
+                              true, false, 0, NULL, NULL, NULL, &err);
     if (!v) return -(err ? err : EIO);
-    ntfs_volume *vol = v->vol;
-    uint32_t state = (vol->flags & VOLUME_IS_DIRTY) ? FNTFS_VSTATE_DIRTY : 0;
-
-    errno = 0;
-    if (ntfs_volume_check_hiberfile(vol, 0)) {
-        state |= errno == EPERM ? FNTFS_VSTATE_HIBERNATED : FNTFS_VSTATE_UNKNOWN;
-    }
-
-    ntfs_inode *ni = ntfs_inode_open(vol, FILE_LogFile);
-    ntfs_attr *na = ni ? ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0) : NULL;
-    if (na) {
-        RESTART_PAGE_HEADER *rp = NULL;
-        if (!ntfs_check_logfile(na, &rp))
-            state |= FNTFS_VSTATE_UNKNOWN;
-        else if (!ntfs_is_logfile_clean(na, rp) ||
-                 (rp && rp->major_ver == const_cpu_to_le16(2) &&
-                        rp->minor_ver == const_cpu_to_le16(0)))
-            state |= FNTFS_VSTATE_LOG_DIRTY;
-        free(rp);
-        ntfs_attr_close(na);
-    } else {
-        state |= FNTFS_VSTATE_UNKNOWN;
-    }
-    if (ni) ntfs_inode_close(ni);
+    uint32_t state = inspect_state(v->vol);
     int rc = fntfs_unmount(v);
     *state_out = state;
     return rc;

@@ -26,7 +26,7 @@ make_image() {
 
 compile_c tests/test_mount_policy.c Sources/FSModule/Bridge/fntfs.c \
     -o "$TASK_TMP/test_mount_policy"
-for state in dirty hibernate journal v2journal; do
+for state in dirty hibernate journal v2journal both; do
     make_image "$TASK_TMP/$state.img"
     "$TASK_TMP/test_mount_policy" "$TASK_TMP/$state.img" "$state"
 done

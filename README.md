@@ -12,14 +12,20 @@ Runs at Full Security on Apple Silicon (developed on macOS 26 / M5).
 ## Features
 
 - Read **and write** NTFS volumes through Apple's official FSKit plumbing.
-- Preserves drives left in **Windows Fast Startup / hibernation**: the dirty
-  flag, hibernation image and journal are inspected before allowing writes.
-  Unsafe or unknown state mounts read-only. MNtfs never resets `$LogFile` or
-  deletes `hiberfil.sys`. Resume Windows and shut it down fully; run `chkdsk /f`
+- Writes to drives left in **Windows Fast Startup / hibernation**: the dirty
+  flag, hibernation image and journal are inspected before allowing writes,
+  and such drives are made writable automatically: `$LogFile` is reset (not
+  replayed) and, if present on the drive, `hiberfil.sys` is deleted, so a
+  hibernated Windows session is lost. This includes drives unplugged from
+  Windows without Safely Remove. After writing from the Mac, connect the drive
+  to Windows only after Windows has started; turning off Fast Startup avoids
+  the issue. Dirty or unverifiable
+  volumes stay read-only, and MNtfs shows the actual reason; run `chkdsk /f`
   on Windows when repair is needed. The state check is not a full filesystem
   verification or journal replay.
 - Runs in the menu bar, starts at login, and **auto-mounts NTFS drives writable
-  at boot** when their safety checks pass — no reopening the app or replugging.
+  at boot** — clean drives, and drives Windows left in Fast Startup /
+  hibernation state (see above) — no reopening the app or replugging.
 - Verify extension enablement through FSKit, including the installed app copy.
   The manager window has a normal application menu and Dock icon while open.
 - Mount/remount through Disk Arbitration with media-attachment identity checks
@@ -51,8 +57,9 @@ The signed, notarized `MNtfs-<version>.dmg` runs on any Apple Silicon Mac
 2. When prompted, allow it to install NTFS name support (one admin password).
 3. Enable **FastNTFSFSModule** in *System Settings → General → Login Items &
    Extensions → File System Extensions*.
-4. Plug in an NTFS drive — clean volumes mount read/write automatically;
-   unsafe or unknown state stays read-only with guidance in the app.
+4. Plug in an NTFS drive — clean volumes and Windows Fast Startup / hibernated
+   volumes mount read/write automatically (the app notes what it reset); dirty
+   or unverifiable volumes stay read-only with guidance in the app.
 
 *Erase* also needs *Privacy & Security → Full Disk Access* for MNtfs, because
 macOS gates raw disk access behind it.

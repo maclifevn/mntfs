@@ -9,6 +9,9 @@
 
 import Foundation
 import FSKit
+import os
+
+private let volumeLog = Logger(subsystem: "com.fastntfs.FSModule", category: "fs")
 
 private func posixError(_ code: Int32) -> NSError {
     NSError(domain: NSPOSIXErrorDomain, code: Int(code))
@@ -16,7 +19,11 @@ private func posixError(_ code: Int32) -> NSError {
 
 final class NTFSVolume: FSVolume {
     private let device: BlockDevice
-    private let readOnly: Bool
+    private var readOnly: Bool
+    /// Read-only requested through the mount arguments ("-o rdonly").
+    private var mountRequestedReadOnly = false
+    /// Windows state (FNTFS_VSTATE_* bits) discarded when this volume mounted.
+    private var discardedWindowState: UInt32 = 0
     private var vol: OpaquePointer?
     private var shutdownError: Int32 = 0
     // Protect the native handle for the WHOLE callback, including two-pass
@@ -241,7 +248,8 @@ extension NTFSVolume: FSVolume.XattrOperations {
                 guard it.inum == fntfs_root_inum() else { throw posixError(ENOATTR) }
                 data = try JSONEncoder().encode(NTFSMountStatus(
                     readOnly: readOnly || fntfs_is_readonly(v), safetyFlags: fntfs_mount_state(v),
-                    io: device.ioStatistics, failureError: fntfs_io_error(v) == 0 ? nil : fntfs_io_error(v)))
+                    io: device.ioStatistics, failureError: fntfs_io_error(v) == 0 ? nil : fntfs_io_error(v),
+                    discardedWindowState: discardedWindowState))
             } else if key == NTFSMountStatus.reparseAttributeName {
                 data = try bridgeData { fntfs_get_reparse(v, it.inum, $0, $1) }
             } else {
@@ -359,6 +367,10 @@ extension NTFSVolume: FSVolume.Operations {
     func activate(options: FSTaskOptions,
                   replyHandler reply: @escaping (FSItem?, Error?) -> Void) {
         operationLock.lock(); defer { operationLock.unlock() }
+        volumeLog.notice("activate options=\(options.taskOptions, privacy: .public)")
+        // Disk Arbitration's mount arguments arrive here, not in loadResource.
+        // A read-only request must never discard Windows state.
+        mountRequestedReadOnly = Self.requestsReadOnly(options.taskOptions)
         do {
             _ = try requireVolume()
             let root = item(inum: fntfs_root_inum(), type: .directory)
@@ -381,7 +393,73 @@ extension NTFSVolume: FSVolume.Operations {
     func mount(options: FSTaskOptions,
                replyHandler reply: @escaping (Error?) -> Void) {
         operationLock.lock(); defer { operationLock.unlock() }
-        reply(nil)
+        // Like MNtfs 0.1.1: a drive Windows left in Fast Startup / hibernation
+        // state is made writable automatically. Done here, not in loadResource:
+        // FSKit's resource flush only works once the kernel mount exists, and
+        // requestedMountOptions is read after mount replies.
+        if !mountRequestedReadOnly {
+            enableWriting(discarding: UInt32(FNTFS_VSTATE_DISCARDABLE))
+        }
+        reply(vol == nil ? posixError(shutdownError == 0 ? EIO : -shutdownError) : nil)
+    }
+
+    /// Mount argument tokens in any argv shape ("-o a,b", "--a", "a").
+    static func requestsReadOnly(_ options: [String]) -> Bool {
+        options.flatMap { $0.split(separator: ",") }
+            .map { $0.drop(while: { $0 == "-" }).trimmingCharacters(in: .whitespaces) }
+            .contains { $0 == "rdonly" || $0 == "ro" }
+    }
+
+    /// loadResource opened the volume read-only because Windows left a Fast
+    /// Startup / unclosed journal or a hibernation image. Reopen it writable:
+    /// fntfs_mount_discarding resets $LogFile (no replay) and deletes
+    /// hiberfil.sys, re-inspects, and mounts read-write if clean. A dirty or
+    /// unverifiable volume, a requested read-only mount, or a failed pass stays
+    /// read-only. The read-only handle wrote nothing.
+    func enableWriting(discarding discard: UInt32) {
+        operationLock.lock(); defer { operationLock.unlock() }
+        guard let current = vol else { return }
+        let state = fntfs_mount_state(current)
+        let discardable = UInt32(FNTFS_VSTATE_DISCARDABLE) & discard
+        guard readOnly, fntfs_io_error(current) == 0, state & discardable != 0,
+              state & ~discardable == 0 else {   // also excludes RO_REQUESTED
+            if state != 0 { volumeLog.notice("kept read-only: state=\(state)") }
+            return
+        }
+        itemsLock.lock()
+        let onlyRoot = items.keys.allSatisfy { $0 == fntfs_root_inum() }
+        itemsLock.unlock()
+        guard onlyRoot else {                // never swap under live items
+            volumeLog.error("kept read-only: volume already in use")
+            return
+        }
+        let closeErr = fntfs_unmount(current)
+        vol = nil
+        var name = [CChar](repeating: 0, count: 256)
+        var serial: UInt64 = 0
+        var err: Int32 = 0
+        var discarded: UInt32 = 0
+        let reopened = closeErr == 0 ? fntfs_mount_discarding(
+            device.opaque, devPread, devPwrite, devFlush, device.sizeBytes,
+            device.sectorSize, discardable, &discarded, &name, &serial, &err) : nil
+        discardedWindowState = discarded
+        if let reopened {
+            vol = reopened
+            readOnly = fntfs_is_readonly(reopened)
+            let io = device.ioStatistics
+            volumeLog.notice("discarded Windows state: discarded=\(discarded) readOnly=\(self.readOnly) state=\(fntfs_mount_state(reopened)) flushErrors=\(io.flushErrors) lastError=\(io.lastError ?? 0)")
+            return
+        }
+        volumeLog.error("discarding Windows state failed: close=\(closeErr) errno=\(err) discarded=\(discarded)")
+        // Reopen as a normal writable request: it falls back to read-only with
+        // the real state bits (a forced read-only open would claim macOS
+        // asked for it). Read-only open is the last resort.
+        vol = fntfs_mount(device.opaque, devPread, devPwrite, devFlush, device.sizeBytes,
+                          device.sectorSize, false, &name, &serial, &err)
+            ?? fntfs_mount(device.opaque, devPread, nil, nil, device.sizeBytes,
+                           device.sectorSize, true, &name, &serial, &err)
+        readOnly = vol.map { fntfs_is_readonly($0) } ?? true
+        if vol == nil { shutdownError = -(err == 0 ? EIO : err) }
     }
 
     func unmount(replyHandler reply: @escaping () -> Void) {

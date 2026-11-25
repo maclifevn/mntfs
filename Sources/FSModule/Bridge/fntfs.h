@@ -86,6 +86,14 @@ enum {
 #define FNTFS_VSTATE_HIBERNATED (1u << 1)  /* valid hibernation image present */
 #define FNTFS_VSTATE_LOG_DIRTY  (1u << 2)  /* $LogFile has pending state      */
 #define FNTFS_VSTATE_UNKNOWN    (1u << 3)  /* a safety check could not finish */
+/* fntfs_mount_state only: macOS asked for a read-only mount. Disk Arbitration
+   does this after the pre-mount check (startCheck) fails, so the bits above
+   are still inspected and reported to explain why. */
+#define FNTFS_VSTATE_RO_REQUESTED (1u << 4)
+/* Windows states MNtfs discards to mount read-write (as MNtfs 0.1.1 did):
+   the Fast Startup / unclosed journal and the hibernation image. A dirty or
+   unverifiable volume is never writable. */
+#define FNTFS_VSTATE_DISCARDABLE (FNTFS_VSTATE_HIBERNATED | FNTFS_VSTATE_LOG_DIRTY)
 
 /*
  * Inspect an unmounted volume's consistency state without modifying anything
@@ -121,10 +129,34 @@ fntfs_vol *_Nullable fntfs_mount(void *_Nullable ctx,
                                  uint64_t *_Nullable serial_out,
                                  int *_Nonnull err_out);
 
+/*
+ * A writable mount that discards the Windows state bits in `discard` (masked
+ * to FNTFS_VSTATE_DISCARDABLE). Only when `discard` covers every unsafe bit:
+ * hiberfil.sys is deleted and $LogFile is reset (not
+ * replayed), then the volume is re-inspected and mounted read-write if clean.
+ * Otherwise it behaves exactly like fntfs_mount and changes nothing.
+ * A failed pass keeps the volume read-only (FNTFS_VSTATE_UNKNOWN is added)
+ * even if it then reads clean. *discarded_out receives the bits that are gone
+ * after the pass, also on failure or a NULL return (0 if none).
+ */
+fntfs_vol *_Nullable fntfs_mount_discarding(void *_Nullable ctx,
+                                            fntfs_pread_cb _Nonnull pread_cb,
+                                            fntfs_pwrite_cb _Nonnull pwrite_cb,
+                                            fntfs_flush_cb _Nonnull flush_cb,
+                                            uint64_t dev_size,
+                                            uint32_t sector_size,
+                                            uint32_t discard,
+                                            uint32_t *_Nonnull discarded_out,
+                                            char *_Nullable name_out,
+                                            uint64_t *_Nullable serial_out,
+                                            int *_Nonnull err_out);
+
 bool fntfs_is_readonly(fntfs_vol *_Nonnull v);
 /* First device/writeback failure, positive errno; 0 until a failure occurs.
    The handle rejects new mutations until unmount, even if the device recovers. */
 int fntfs_io_error(fntfs_vol *_Nonnull v);
+/* FNTFS_VSTATE_* found at mount time. A requested read-only mount sets
+   FNTFS_VSTATE_RO_REQUESTED plus whatever the read-only inspection found. */
 uint32_t fntfs_mount_state(fntfs_vol *_Nonnull v);
 
 /* Flush everything and release the volume. Returns 0 or -errno. */

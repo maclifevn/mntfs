@@ -119,7 +119,9 @@ struct DiagnosticReport: Codable, Identifiable, Sendable {
             } else if let module = volume.module {
                 let errors = module.io.readErrors + module.io.writeErrors + module.io.flushErrors
                 status = volume.readOnly || errors > 0 ? .warning : .ok
-                detail = (volume.readOnly ? module.readOnlyExplanation : "Mounted read/write; mount-time safety check passed.") +
+                detail = (volume.readOnly ? module.readOnlyExplanation
+                          : module.discardedExplanation.map { "Mounted read/write. " + $0 }
+                            ?? "Mounted read/write; mount-time safety check passed.") +
                     " I/O errors: \(errors); flush calls: \(module.io.flushCalls)."
             } else {
                 status = .unknown

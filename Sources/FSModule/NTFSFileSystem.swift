@@ -71,8 +71,12 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             return
         }
         lastResource = block
-        let readOnly = options.taskOptions.contains("--rdonly")
+        let taskOptions = options.taskOptions
+        let readOnly = taskOptions.contains("--rdonly")
             || !block.isWritable
+        // Windows Fast Startup / hibernation state is discarded later, in
+        // NTFSVolume.mount(options:), where FSKit's resource flush works.
+        log.notice("load \(block.bsdName, privacy: .public) options=\(taskOptions, privacy: .public) writableResource=\(block.isWritable)")
 
         let dev = BlockDevice(resource: block)
         var name = [CChar](repeating: 0, count: 256)
@@ -90,7 +94,7 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
         let label = String(cString: name)
         let effectiveReadOnly = fntfs_is_readonly(v)
-        log.info("mounted \(block.bsdName, privacy: .public) readOnly=\(effectiveReadOnly) safetyState=\(fntfs_mount_state(v))")
+        log.notice("mounted \(block.bsdName, privacy: .public) readOnly=\(effectiveReadOnly) safetyState=\(fntfs_mount_state(v))")
         let volume = NTFSVolume(device: dev, readOnly: effectiveReadOnly, vol: v,
                                 name: label, serial: serial)
         activeVolume = volume
@@ -141,6 +145,7 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
                 task.didComplete(error: nil)
                 return
             }
+            let onlyWindowsState = state & ~UInt32(FNTFS_VSTATE_DISCARDABLE) == 0
             if state & UInt32(FNTFS_VSTATE_DIRTY) != 0 {
                 task.logMessage("MNtfs: the volume dirty flag is set — Windows did not shut it down cleanly")
             }
@@ -153,7 +158,16 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
             if state & UInt32(FNTFS_VSTATE_UNKNOWN) != 0 {
                 task.logMessage("MNtfs: one or more safety checks could not complete")
             }
-            task.logMessage("MNtfs keeps this volume read-only. Resume Windows and shut down fully; run chkdsk /f on Windows if repair is needed. MNtfs never resets the journal or removes hiberfil.sys.")
+            // Disk Arbitration runs this check before every mount and forces a
+            // read-only mount when it fails. Windows Fast Startup / hibernation
+            // state is discarded by the mount itself (as in 0.1.1), so it must
+            // not fail the check; a dirty or unverifiable volume still does.
+            if onlyWindowsState {
+                task.logMessage("Windows left this volume in Fast Startup or hibernation state. A read-write mount by MNtfs resets the journal and deletes hiberfil.sys (the hibernated session is lost); a read-only mount changes nothing. Run chkdsk /f on Windows if it reports problems.")
+                task.didComplete(error: nil)
+                return
+            }
+            task.logMessage("MNtfs keeps this volume read-only. Resume Windows and shut down fully; run chkdsk /f on Windows if repair is needed.")
             task.didComplete(error: posixError(EBUSY))
         }
         return progress

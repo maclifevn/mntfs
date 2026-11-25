@@ -575,6 +575,13 @@ int main(int argc, char **argv)
     CHECK(fntfs_check_state(NULL, cb_pread, dev_size, SECTOR, &vstate) == 0,
           "check_state");
     CHECK(vstate == 0, "volume should be clean, state=0x%x", vstate);
+    int roerr = 0;
+    v = fntfs_mount(NULL, cb_pread, NULL, NULL, dev_size, SECTOR, true,
+                    NULL, NULL, &roerr);
+    CHECK(v && fntfs_mount_state(v) == FNTFS_VSTATE_RO_REQUESTED,
+          "requested read-only mount of a clean volume: state=0x%x",
+          v ? fntfs_mount_state(v) : 0);
+    CHECK(fntfs_unmount(v) == 0, "unmount read-only");
     printf("check_state ok (clean)\n");
 
     /* --- bounce-buffer clamping (white-box; trashes the image, keep last) --- */
